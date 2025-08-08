@@ -1,33 +1,66 @@
 <?php
 require_once 'config.php';
 
-try {
-    $tables = $pdo->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN);
-    
-    if (!$tables) {
-        die("No tables found in the database.");
-    }
+function getDatabaseSchema($pdo) {
+    $database = DB_NAME;
+    $schema = [];
 
-    echo "<h2>Database Schema for " . DB_NAME . "</h2>";
+    // Get all tables
+    $stmt = $pdo->query("SHOW TABLES");
+    $tables = $stmt->fetchAll(PDO::FETCH_COLUMN);
 
     foreach ($tables as $table) {
-        echo "<h3>Table: $table</h3>";
-        $stmt = $pdo->query("DESCRIBE `$table`");
-        $columns = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $tableInfo = [
+            'columns' => [],
+            'primary_key' => [],
+            'foreign_keys' => [],
+        ];
 
-        echo "<table border='1' cellpadding='5'>";
-        echo "<tr><th>Field</th><th>Type</th><th>Null</th><th>Key</th><th>Default</th><th>Extra</th></tr>";
-
-        foreach ($columns as $col) {
-            echo "<tr>";
-            foreach ($col as $value) {
-                echo "<td>" . htmlspecialchars($value) . "</td>";
+        // Get columns
+        $stmt = $pdo->query("SHOW FULL COLUMNS FROM `$table`");
+        $columns = $stmt->fetchAll();
+        foreach ($columns as $column) {
+            $tableInfo['columns'][] = [
+                'Field' => $column['Field'],
+                'Type' => $column['Type'],
+                'Null' => $column['Null'],
+                'Key' => $column['Key'],
+                'Default' => $column['Default'],
+                'Extra' => $column['Extra'],
+                'Comment' => $column['Comment']
+            ];
+            if ($column['Key'] == 'PRI') {
+                $tableInfo['primary_key'][] = $column['Field'];
             }
-            echo "</tr>";
         }
-        echo "</table><br>";
+
+        // Get foreign keys
+        $stmt = $pdo->prepare("
+            SELECT
+                COLUMN_NAME,
+                REFERENCED_TABLE_NAME,
+                REFERENCED_COLUMN_NAME
+            FROM
+                INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE
+                TABLE_NAME = :table AND
+                TABLE_SCHEMA = :schema AND
+                REFERENCED_TABLE_NAME IS NOT NULL
+        ");
+        $stmt->execute(['table' => $table, 'schema' => $database]);
+        $fks = $stmt->fetchAll();
+        foreach ($fks as $fk) {
+            $tableInfo['foreign_keys'][] = $fk;
+        }
+
+        $schema[$table] = $tableInfo;
     }
-} catch (PDOException $e) {
-    echo "Error retrieving schema: " . $e->getMessage();
+
+    return $schema;
 }
+
+// Output schema as JSON
+header('Content-Type: application/json');
+$schema = getDatabaseSchema($pdo);
+echo json_encode($schema, JSON_PRETTY_PRINT);
 ?>
