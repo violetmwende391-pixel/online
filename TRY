@@ -1,0 +1,880 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
+#include <ArduinoJson.h>
+
+// =============================================
+// Configuration Section - Adjustable Parameters
+// =============================================
+
+// Hardware Pin Configuration
+#define FLOW_SENSOR_PIN 27
+#define VALVE_ENABLE_PIN 26
+#define VALVE_IN1_PIN 25
+#define VALVE_IN2_PIN 33
+#define LED_BUILTIN 2  // Most ESP32 boards have LED on GPIO2
+
+// Flow Sensor Calibration
+#define FLOW_CALIBRATION 7.5  // Pulses per liter
+#define DEBOUNCE_TIME 10      // ms debounce for flow sensor
+
+// Valve Control Parameters
+#define VALVE_OPERATION_TIME 5000    // ms for full valve operation
+#define VALVE_DEBOUNCE_INTERVAL 10000 // Minimum time between valve state changes
+
+// System Timing Parameters
+#define FLOW_CALC_INTERVAL 1000      // Calculate flow every second
+#define SERVER_SEND_INTERVAL 5000    // Send data to server every 5 seconds
+#define COMMAND_CHECK_INTERVAL 5000  // Check for commands every 5 seconds
+#define SAVE_INTERVAL 30000          // Save to flash every 30 seconds
+#define WIFI_RETRY_INTERVAL 30000    // WiFi reconnect interval
+#define MANUAL_OVERRIDE_TIMEOUT 30000 // 30 seconds manual override
+
+// Business Logic Parameters
+#define PRICE_PER_LITER 1.0
+#define MIN_BALANCE_THRESHOLD 0.10   // Minimum balance to keep valve open (KES)
+
+// Watchdog Configuration
+#define WATCHDOG_TIMEOUT_SEC 60
+
+// Network Configuration
+const char* ssid = "GalaxyA23B729";
+const char* password = "Chris1234";
+const char* serverIP = "192.168.26.121";
+const char* commandEndpoint = "/smart/get_command.php";
+const char* logEndpoint = "/smart/log_data.php";
+const char* serialEndpoint = "/smart/get_serial.php";
+
+// =============================================
+// System State and Data Structures
+// =============================================
+
+// Enhanced Valve State with error conditions
+enum ValveState { 
+  CLOSED, 
+  OPENING, 
+  OPEN, 
+  CLOSING,
+  ERROR_STUCK,
+  ERROR_TIMEOUT
+};
+
+// Meter Configuration Structure
+typedef struct {
+  char serial[32];
+  float totalVolume;
+  float balance;
+  String operationMode;
+  ValveState valveState;
+  bool manualControl;
+} MeterConfig;
+
+// System State Structure
+typedef struct {
+  volatile unsigned long pulseCount;
+  unsigned long lastPulseTime; 
+  float flowRate;
+  float sessionVolume;
+  unsigned long lastValveAction;
+  unsigned long manualCommandTime;
+  unsigned long lastLoopTime;
+} SystemState;
+
+// Global Variables
+MeterConfig meterConfig = {
+  .serial = "9999", // Default serial if server fails
+  .totalVolume = 0.0,
+  .balance = 0.0, 
+  .operationMode = "prepaid",
+  .valveState = CLOSED,
+  .manualControl = false
+};
+
+SystemState systemState = {
+  .pulseCount = 0,
+  .lastPulseTime = 0,
+  .flowRate = 0.0,
+  .sessionVolume = 0.0,
+  .lastValveAction = 0,
+  .manualCommandTime = 0,
+  .lastLoopTime = 0
+};
+
+Preferences preferences;
+
+// =============================================
+// Interrupt Service Routine
+// =============================================
+
+void IRAM_ATTR pulseCounter() {
+  unsigned long now = millis();
+  if (now - systemState.lastLoopTime > DEBOUNCE_TIME) {
+    systemState.pulseCount++;
+    systemState.lastLoopTime = now;
+      digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // Visual pulse indicator
+  }
+}
+
+// =============================================
+// Core System Functions
+// =============================================
+/**
+ * Generates a unique device ID from the ESP32's MAC address
+ */
+String getDeviceID() {
+  uint64_t chipid = ESP.getEfuseMac(); // 48-bit MAC
+  char id[13];
+  sprintf(id, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+  return String(id);
+}
+/**
+ * In
+ * itialize the system hardware and load saved state
+ */
+
+
+
+// Function prototypes
+
+void initializeNetwork();
+void printSystemStatus();
+void calculateFlowRate();
+void manageValve();
+void performSystemMaintenance();
+bool sendToServer();
+void checkForAdminCommand();
+bool connectToWiFi();
+void fetchMeterSerialWithRetry(uint8_t maxRetries);
+bool fetchMeterSerial();
+String valveStateToString(ValveState state);
+
+ 
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Allow serial to stabilize
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  Serial.println("\n\n=== Water Meter Control System ===");
+  Serial.println("Initializing system...");
+
+  // Initialize Watchdog Timer
+    esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+  Serial.println("✅ Watchdog initialized");
+
+
+  // Initialize hardware pins
+   pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(VALVE_ENABLE_PIN, OUTPUT);
+  pinMode(VALVE_IN1_PIN, OUTPUT);
+  pinMode(VALVE_IN2_PIN, OUTPUT);
+  digitalWrite(VALVE_ENABLE_PIN, LOW);
+  
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), pulseCounter, RISING);
+  Serial.println("✅ Hardware initialized");
+
+
+  // Load saved configuration
+  preferences.begin("water-meter", false);
+  meterConfig.totalVolume = preferences.getFloat("totalVolume", 0);
+  meterConfig.balance = preferences.getFloat("balance", 0); // Load balance
+  meterConfig.operationMode = preferences.getString("mode", "prepaid");
+  meterConfig.valveState = (ValveState)preferences.getUInt("valveState", CLOSED);
+  meterConfig.manualControl = preferences.getBool("manualControl", false);
+  
+  String savedSerial = preferences.getString("serial", "");
+  if (savedSerial.length() > 0) {
+    savedSerial.toCharArray(meterConfig.serial, sizeof(meterConfig.serial));
+  }
+  preferences.end();
+
+   // Initialize valve state
+  if (meterConfig.valveState == OPEN) {
+    digitalWrite(VALVE_IN1_PIN, HIGH);
+    digitalWrite(VALVE_IN2_PIN, LOW);
+    Serial.println("🔓 Initial valve state: OPEN");
+  } else {
+    digitalWrite(VALVE_IN1_PIN, LOW);
+    digitalWrite(VALVE_IN2_PIN, HIGH);
+    Serial.println("🔒 Initial valve state: CLOSED");
+  }
+
+
+  // Connect to WiFi and fetch meter serial
+  initializeNetwork();
+
+  Serial.println("\n=== System Initialization Complete ===");
+  printSystemStatus();
+}
+
+/**
+ * Main system loop
+ */
+void loop() {
+  unsigned long now = millis();
+   esp_task_wdt_reset();   
+  unsigned long loopStart = millis();
+  esp_task_wdt_reset(); // Reset watchdog timer
+   
+
+  // 1. Handle network connectivity
+   if (now - systemState.lastLoopTime > WIFI_RETRY_INTERVAL) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("🔁 Reconnecting WiFi...");
+      WiFi.reconnect();
+    }
+    systemState.lastLoopTime = now;
+  }
+
+  // 2. Calculate and process flow data
+  if (now - systemState.lastLoopTime > FLOW_CALC_INTERVAL) {
+    calculateFlowRate();
+    systemState.lastLoopTime = now;
+  }
+
+  // 3. Handle server communication
+ static unsigned long lastSendTime = 0;
+  if (now - lastSendTime > SERVER_SEND_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (sendToServer()) {
+        systemState.sessionVolume = 0; // Reset on successful send
+      }
+    }
+    lastSendTime = now;
+  }
+
+
+  // 4. Manage valve state and operations
+  manageValve();
+
+  // 5. Check for manual override timeout
+  if (meterConfig.manualControl && 
+      now - systemState.manualCommandTime > MANUAL_OVERRIDE_TIMEOUT) {
+    meterConfig.manualControl = false;
+    preferences.begin("water-meter", false);
+    preferences.putBool("manualControl", false);
+    preferences.end();
+    Serial.println("🔄 Manual control timeout - Returning to AUTO mode");
+  }
+
+
+  // 6. Periodic system maintenance
+  performSystemMaintenance();
+
+
+   // 7. Check for admin commands (every 5 seconds)
+  static unsigned long lastCommandTime = 0;
+  if (now - lastCommandTime > COMMAND_CHECK_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      checkForAdminCommand();
+    }
+    lastCommandTime = now;
+  }
+
+}
+
+  // Debug: Print loop duration
+  // Serial.printf("⏱ Loop duration: %lu ms\n", millis() - loopStart);
+//}
+
+// =============================================
+// Initialization Functions
+// =============================================
+
+void initializeWatchdog() {
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, // Watch all cores
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+  Serial.println("✅ Watchdog initialized");
+}
+
+void initializeHardware() {
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(VALVE_ENABLE_PIN, OUTPUT);
+  pinMode(VALVE_IN1_PIN, OUTPUT);
+  pinMode(VALVE_IN2_PIN, OUTPUT);
+  digitalWrite(VALVE_ENABLE_PIN, LOW);
+  
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), pulseCounter, RISING);
+  Serial.println("✅ Hardware initialized");
+}
+
+void loadConfiguration() {
+  preferences.begin("water-meter", false);
+  
+  meterConfig.totalVolume = preferences.getFloat("totalVolume", 0);
+  meterConfig.operationMode = preferences.getString("mode", "prepaid");
+  meterConfig.valveState = (ValveState)preferences.getUInt("valveState", CLOSED);
+  meterConfig.manualControl = preferences.getBool("manualControl", false);
+  
+  // Try to load serial from preferences if available
+  String savedSerial = preferences.getString("serial", "");
+  if (savedSerial.length() > 0) {
+    savedSerial.toCharArray(meterConfig.serial, sizeof(meterConfig.serial));
+    Serial.println("📁 Loaded serial from flash: " + String(meterConfig.serial));
+    
+    // Add device ID to the serial for identification
+    String deviceID = getDeviceID();
+    Serial.println("🆔 Device ID: " + deviceID);
+  }
+  
+  preferences.end();
+
+  // Rest of the function remains the same...
+  if (meterConfig.valveState == OPEN) {
+    digitalWrite(VALVE_IN1_PIN, HIGH);
+    digitalWrite(VALVE_IN2_PIN, LOW);
+    Serial.println("🔓 Initial valve state: OPEN");
+  } else {
+    digitalWrite(VALVE_IN1_PIN, LOW);
+    digitalWrite(VALVE_IN2_PIN, HIGH);
+    Serial.println("🔒 Initial valve state: CLOSED");
+  }
+}
+
+void initializeNetwork() {
+  if (connectToWiFi()) {
+    // Only fetch serial if we don't have one saved
+    if (strlen(meterConfig.serial) == 0 || strcmp(meterConfig.serial, "9999") == 0) {
+      fetchMeterSerialWithRetry(3); // Try 3 times to fetch serial
+    } else {
+      Serial.println("ℹ Using previously assigned meter serial: " + String(meterConfig.serial));
+    }
+  } else {
+    Serial.println("⚠ Proceeding with offline mode using saved configuration");
+  }
+}
+
+// =============================================
+// Network Management Functions
+// =============================================
+
+bool connectToWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  Serial.print("📶 Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+
+  unsigned long startTime = millis();
+unsigned long wifiStartTime = millis();
+while (WiFi.status() != WL_CONNECTED && millis() - wifiStartTime < 10000) {
+  delay(500);
+  Serial.print(".");
+}if (WiFi.status() != WL_CONNECTED) {  Serial.println("WiFi failed to connect.");
+  // Optionally restart or go into safe mode
+}
+
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected");
+    Serial.println("IP Address: " + WiFi.localIP().toString());
+    return true;
+  } else {
+    Serial.println("\n❌ WiFi Connection Failed");
+    return false;
+  }
+}
+
+void manageNetworkConnection() {
+  static unsigned long lastCheck = 0;
+  
+  if (millis() - lastCheck > WIFI_RETRY_INTERVAL) {
+    lastCheck = millis();
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("🔁 Attempting WiFi reconnection...");
+      WiFi.reconnect();
+      
+      if (WiFi.status() != WL_CONNECTED) {
+        connectToWiFi();
+      }
+    }
+  }
+}
+
+void fetchMeterSerialWithRetry(uint8_t maxRetries) {
+  for (uint8_t attempt = 1; attempt <= maxRetries; attempt++) {
+    Serial.printf("🔍 Fetching meter serial (Attempt %d/%d)...\n", attempt, maxRetries);
+    
+    if (fetchMeterSerial()) {
+      return; // Success
+    }
+    
+    if (attempt < maxRetries) {
+      delay(1000 * attempt); // Exponential backoff
+    }
+  }
+  
+  Serial.println("⚠ Could not fetch serial after retries, using saved value");
+}
+
+bool fetchMeterSerial() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ Not connected to WiFi for serial fetch");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(serverIP) + serialEndpoint;
+  
+  if (!http.begin(url)) {
+    Serial.println("❌ Failed to begin HTTP connection");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  
+  // Get device ID and prepare POST data
+  String deviceID = getDeviceID();
+  String postData = "device_id=" + deviceID;
+ // Using channel 0 as per your example
+  
+  http.setTimeout(4000);
+  int httpCode = http.POST(postData);
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    payload.trim();
+    
+    if (payload.length() > 0 && payload.indexOf(" ") == -1) {
+      int len = min(payload.length(), sizeof(meterConfig.serial) - 1);
+      payload.toCharArray(meterConfig.serial, len + 1);
+      
+      // Save the serial to preferences
+      preferences.begin("water-meter", false);
+      preferences.putString("serial", meterConfig.serial);
+      preferences.end();
+      
+      Serial.println("✅ Meter serial received: " + String(meterConfig.serial));
+      http.end();
+      return true;
+    } else {
+      Serial.println("⚠ Invalid serial response: " + payload);
+    }
+  } else {
+    Serial.println("❌ Failed to get meter serial. Code: " + String(httpCode) + 
+                 ", Response: " + http.getString());
+  }
+
+  http.end();
+  return false;
+}
+// =============================================
+// Flow Measurement Functions
+// =============================================
+
+void calculateFlowRate() {
+  // Safely read and reset pulse count
+  noInterrupts();
+  unsigned long pulses = systemState.pulseCount;
+  systemState.pulseCount = 0;
+  interrupts();
+
+  // Calculate flow rate (L/min) and volume (L)
+  systemState.flowRate = pulses / FLOW_CALIBRATION;
+  float liters = systemState.flowRate / 60.0;
+  
+  // Track water usage when valve is open
+  systemState.sessionVolume += liters;
+  meterConfig.totalVolume += liters;
+    
+    // Debug output
+   Serial.printf("Pulses: %lu | Flow: %.2f L/min | Volume: %.3f L | Balance: %.2f KES\n", 
+               pulses, systemState.flowRate, liters, meterConfig.balance);
+
+  
+}
+
+// =============================================
+// Valve Control Functions
+// =============================================
+void manageValve() {
+  static unsigned long valveOperationStart = 0;
+  static bool valveOperating = false;
+  if (valveOperating) {
+    if (millis() - valveOperationStart >= VALVE_OPERATION_TIME * 2) {
+      // Valve operation timeout
+      digitalWrite(VALVE_ENABLE_PIN, LOW);
+      valveOperating = false;
+      meterConfig.valveState = ERROR_TIMEOUT;
+      Serial.println("‼️ Valve operation timeout!");
+    } 
+    else if (millis() - valveOperationStart >= VALVE_OPERATION_TIME) {
+      // Normal operation complete
+      digitalWrite(VALVE_ENABLE_PIN, LOW);
+      valveOperating = false;
+      
+      if (meterConfig.valveState == OPENING) {
+        meterConfig.valveState = OPEN;
+        Serial.println("✅ Valve fully OPEN");
+      } else if (meterConfig.valveState == CLOSING) {
+        meterConfig.valveState = CLOSED;
+        Serial.println("✅ Valve fully CLOSED");
+      }
+      saveValveState();
+    }
+  }
+}
+
+void openValve() {
+  // Check if we're already opening or open
+  if (meterConfig.valveState == OPEN || meterConfig.valveState == OPENING) {
+    return;
+  }
+  
+  // Check debounce interval
+  if (millis() - systemState.lastValveAction < VALVE_DEBOUNCE_INTERVAL) {
+    Serial.println("⚠ Valve operation debounced - too frequent");
+    return;
+  }
+
+  Serial.println("🔓 Opening valve...");
+  meterConfig.valveState = OPENING;
+  digitalWrite(VALVE_IN1_PIN, HIGH);
+  digitalWrite(VALVE_IN2_PIN, LOW);
+  digitalWrite(VALVE_ENABLE_PIN, HIGH);
+  systemState.lastValveAction = millis();
+}
+
+void closeValve() {
+  // Check if we're already closing or closed
+  if (meterConfig.valveState == CLOSED || meterConfig.valveState == CLOSING) {
+    return;
+  }
+  
+  // Check debounce interval
+  if (millis() - systemState.lastValveAction < VALVE_DEBOUNCE_INTERVAL) {
+    Serial.println("⚠ Valve operation debounced - too frequent");
+    return;
+  }
+
+  Serial.println("🔒 Closing valve...");
+  meterConfig.valveState = CLOSING;
+  digitalWrite(VALVE_IN1_PIN, LOW);
+  digitalWrite(VALVE_IN2_PIN, HIGH);
+  digitalWrite(VALVE_ENABLE_PIN, HIGH);
+  systemState.lastValveAction = millis();
+}
+
+void saveValveState() {
+ if (millis() - systemState.lastLoopTime > SAVE_INTERVAL) {
+    preferences.begin("water-meter", false);
+    preferences.putFloat("totalVolume", meterConfig.totalVolume);
+    preferences.putFloat("balance", meterConfig.balance);
+    preferences.putString("mode", meterConfig.operationMode);
+    preferences.putUInt("valveState", meterConfig.valveState);
+    preferences.putBool("manualControl", meterConfig.manualControl);
+    preferences.end();
+    systemState.lastLoopTime = millis();
+    Serial.println("💾 System state saved to flash");
+    }
+}
+
+// =============================================
+// Server Communication Functions
+// =============================================
+
+void handleServerCommunication() {
+  static unsigned long lastSendTime = 0;
+  static unsigned long lastCommandTime = 0;
+
+  // Send data to server at regular intervals
+  if (millis() - lastSendTime > SERVER_SEND_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (sendToServer()) {
+        systemState.sessionVolume = 0; // Reset on successful send
+      }
+    }
+    lastSendTime = millis();
+  }
+
+  // Check for commands from server
+  if (millis() - lastCommandTime > COMMAND_CHECK_INTERVAL) {
+    if (WiFi.status() == WL_CONNECTED) {
+      checkForAdminCommand();
+    }
+    lastCommandTime = millis();
+  }
+}
+
+bool sendToServer() {
+  HTTPClient http;
+  String url = "http://" + String(serverIP) + logEndpoint;
+  
+    // Reset watchdog before starting
+  esp_task_wdt_reset();
+  if (!http.begin(url)) {
+    Serial.println("❌ Failed to begin HTTP connection to server");
+    return false;
+  }
+
+  http.setTimeout(10000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Connection", "close");
+
+  // Create JSON payload
+  DynamicJsonDocument doc(512);
+  doc["flow"] = systemState.flowRate;
+  doc["volume"] = systemState.sessionVolume;
+  doc["total_volume"] = meterConfig.totalVolume;
+  doc["mode"] = meterConfig.operationMode;
+  doc["valve_status"] = valveStateToString(meterConfig.valveState);
+  doc["balance"] = meterConfig.balance; // Placeholder for future implementation
+  doc["meter_serial"] = meterConfig.serial;
+  doc["manual_control"] = meterConfig.manualControl;
+
+  String json;
+  serializeJson(doc, json);
+
+  // Send with retry logic
+  for (int attempt = 0; attempt < 2; attempt++) {
+    esp_task_wdt_reset();
+    Serial.println("📤 Attempting to send data to server...");
+    int code = http.POST(json);
+    esp_task_wdt_reset();
+
+   if (code == HTTP_CODE_OK) {
+      String response = http.getString();
+      Serial.println("✅ Server response: " + response);
+      http.end();
+      return true;
+    }
+    if (attempt < 1) {
+      Serial.printf("⚠ Send failed (attempt %d), retrying...\n", attempt + 1);
+      delay(2000);
+    }
+  }
+
+  Serial.println("❌ Server send failed: " + String(http.errorToString(http.GET())));
+  http.end();
+  return false;
+}
+
+String valveStateToString(ValveState state) {
+  switch (state) {
+    case OPEN: return "open";
+    case OPENING: return "opening";
+    case CLOSED: return "closed";
+    case CLOSING: return "closing";
+    case ERROR_STUCK: return "error_stuck";
+    case ERROR_TIMEOUT: return "error_timeout";
+    default: return "unknown";
+  }
+}
+
+void checkForAdminCommand() {
+  HTTPClient http;
+  String url = "http://" + String(serverIP) + commandEndpoint + "?meter_serial=" + meterConfig.serial;
+  
+  if (!http.begin(url)) {
+    Serial.println("❌ Failed to begin HTTP command connection");
+    return;
+  }
+
+  http.setTimeout(5000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Connection", "close");
+
+  Serial.println("🔍 Requesting command from: " + url);
+  
+  esp_task_wdt_reset();
+  int httpCode = http.GET();
+  esp_task_wdt_reset();
+
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.println("❌ HTTP error: " + String(httpCode) + " - " + http.errorToString(httpCode));
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  payload.trim();
+  Serial.println("📥 Raw server response: " + payload);
+
+  // Validate JSON structure
+  if (!payload.startsWith("{") || !payload.endsWith("}")) {
+    Serial.println("⚠ Invalid JSON response from server");
+    http.end();
+    return;
+  }
+
+  // Parse JSON
+  DynamicJsonDocument doc(512);
+  DeserializationError error = deserializeJson(doc, payload);
+  
+  if (error) {
+    Serial.println("❌ JSON parsing failed: " + String(error.c_str()));
+    http.end();
+    return;
+  }
+
+  // Process command if status is success
+  const char* status = doc["status"] | "error";
+  if (strcmp(status, "success") != 0) {
+    Serial.println("⚠ Server returned error status: " + String(status));
+    http.end();
+    return;
+  }
+
+  Serial.println("✅ Valid command received");
+  processAdminCommand(doc);
+  http.end();
+}
+
+void processAdminCommand(JsonDocument& doc) {
+  // Extract command parameters with defaults
+  float currentBalance = doc["balance"] | 0.0f;
+  const char* valveCommand = doc["valve_command"] | "";
+  const char* mode = doc["mode"] | "";
+
+  // Handle valve commands
+  if (strcmp(valveCommand, "open") == 0) {
+    meterConfig.manualControl = true;
+    systemState.manualCommandTime = millis();
+    openValve();
+    Serial.println("🔄 Manual OPEN command received");
+  } 
+  else if (strcmp(valveCommand, "close") == 0) {
+    meterConfig.manualControl = true;
+    systemState.manualCommandTime = millis();
+    closeValve();
+    Serial.println("🔄 Manual CLOSE command received");
+  } 
+  else if (strcmp(valveCommand, "auto") == 0) {
+    meterConfig.manualControl = false;
+    Serial.println("🔄 AUTO mode activated");
+  }
+
+  // Handle mode changes
+  if (strlen(mode) > 0 && meterConfig.operationMode != mode) {
+    changeOperationMode(mode);
+  }
+
+  // Automatic valve control (if not in manual mode)
+  if (!meterConfig.manualControl) {
+    handleAutomaticValveControl(currentBalance);
+  }
+}
+
+void changeOperationMode(const char* mode) {
+  meterConfig.operationMode = mode;
+  
+  preferences.begin("water-meter", false);
+  preferences.putString("mode", meterConfig.operationMode);
+  preferences.end();
+  
+  Serial.printf("🔄 Mode changed to %s\n", mode);
+
+  // In postpaid mode, open valve if closed
+  if (strcmp(mode, "postpaid") == 0 && 
+      (meterConfig.valveState == CLOSED || meterConfig.valveState == CLOSING)) {
+    openValve();
+  }
+}
+
+void handleAutomaticValveControl(float balance) {
+  if (meterConfig.operationMode == "prepaid") {
+    // Open valve if balance is sufficient and valve is currently closed
+    if (balance > MIN_BALANCE_THRESHOLD) {
+      if (meterConfig.valveState == CLOSED || meterConfig.valveState == CLOSING) {
+        Serial.printf("💰 Balance available (%.2f KES), opening valve\n", balance);
+        openValve();
+      }
+    } else {
+      // Close valve if balance is too low and valve is open
+      if (meterConfig.valveState == OPEN || meterConfig.valveState == OPENING) {
+        Serial.printf("⚠ Low balance (%.2f KES), closing valve\n", balance);
+        closeValve();
+      }
+    }
+
+    // 💸 Deduct balance only if valve is open and NOT under manual control
+    if (meterConfig.valveState == OPEN && !meterConfig.manualControl) {
+      float deducted = systemState.sessionVolume * PRICE_PER_LITER;
+
+      if (deducted > 0.0) {
+        meterConfig.balance -= deducted;
+        Serial.printf("💸 Deducted %.2f KES for %.3f L\n", deducted, systemState.sessionVolume);
+
+        // Prevent negative balance
+        if (meterConfig.balance <= 0) {
+          meterConfig.balance = 0;
+          Serial.println("⚠ Balance depleted. Closing valve...");
+          closeValve();
+        }
+
+        // Save new balance to flash
+        preferences.begin("water-meter", false);
+        preferences.putFloat("balance", meterConfig.balance);
+        preferences.end();
+      }
+    }
+  } 
+  else { // Postpaid mode
+    if (meterConfig.valveState == CLOSED || meterConfig.valveState == CLOSING) {
+      Serial.println("📝 Postpaid mode, opening valve");
+      openValve();
+    }
+  }
+}
+
+// =============================================
+// System Management Functions
+// =============================================
+
+void checkManualOverride() {
+  if (meterConfig.manualControl && 
+      millis() - systemState.manualCommandTime > MANUAL_OVERRIDE_TIMEOUT) {
+    meterConfig.manualControl = false;
+    preferences.begin("water-meter", false);
+    preferences.putBool("manualControl", false);
+    preferences.end();
+    Serial.println("🔄 Manual control timeout - Returning to AUTO mode");
+  }
+}
+
+void performSystemMaintenance() {
+  static unsigned long lastSaveTime = 0;
+
+  // Save data to flash at regular intervals
+  if (millis() - lastSaveTime > SAVE_INTERVAL) {
+    preferences.begin("water-meter", false);
+    preferences.putFloat("totalVolume", meterConfig.totalVolume);
+    preferences.putString("mode", meterConfig.operationMode);
+    preferences.putUInt("valveState", meterConfig.valveState);
+    preferences.putBool("manualControl", meterConfig.manualControl);
+    preferences.end();
+    
+    lastSaveTime = millis();
+    Serial.println("💾 System state saved to flash");
+  }
+}
+
+// =============================================
+// Debug and Status Functions
+// =============================================
+
+void printSystemStatus() {
+  Serial.println("\n=== SYSTEM STATUS ===");
+  Serial.printf("Device ID: %s\n", getDeviceID().c_str());
+  Serial.printf("Meter Serial: %s\n", meterConfig.serial);
+  Serial.printf("Operation Mode: %s\n", meterConfig.operationMode.c_str());
+  Serial.printf("Valve State: %s\n", valveStateToString(meterConfig.valveState));
+  Serial.printf("Manual Control: %s\n", meterConfig.manualControl ? "YES" : "NO");
+  Serial.printf("Total Volume: %.3f L\n", meterConfig.totalVolume);
+  Serial.printf("Current Flow: %.2f L/min\n", systemState.flowRate);
+  Serial.printf("WiFi Status: %s\n", WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+  Serial.println("====================\n");
+}

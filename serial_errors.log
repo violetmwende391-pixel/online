@@ -1,0 +1,9 @@
+ [06-Aug-2025 23:23:14 Europe/Berlin] [2025-08-06 23:23:14] Received request - Device ID: TEST12345678, Channel: 0
+[06-Aug-2025 23:23:14 Europe/Berlin] ERROR: Invalid or missing device_id
+[06-Aug-2025 23:26:38 Europe/Berlin] [2025-08-06 23:26:38] Received raw POST data: 
+[06-Aug-2025 23:26:38 Europe/Berlin] [2025-08-06 23:26:38] Processed values - Device ID: TEST12345678, Channel: 0
+[06-Aug-2025 23:26:38 Europe/Berlin] ERROR: No available meters for channel 0
+[06-Aug-2025 23:39:51 Europe/Berlin] [REQUEST] Raw input: 
+[06-Aug-2025 23:39:51 Europe/Berlin] ERROR: Empty device_id received
+[06-Aug-2025 23:44:40 Europe/Berlin] Raw POST: 
+[06-Aug-2025 23:44:41 Europe/Berlin] Raw POST: 
