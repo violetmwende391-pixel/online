@@ -9,11 +9,14 @@ $meter_id = isset($_GET['id']) ? intval($_GET['id']) : 0;
 
 try {
     // Get meter details
-    $stmt = $pdo->prepare("SELECT m.*, u.username, u.full_name, u.account_type 
-                          FROM meters m 
-                          LEFT JOIN users u ON m.user_id = u.user_id 
-                          WHERE m.meter_id = ? AND (m.user_id = ? OR ? = 1)");
-    $stmt->execute([$meter_id, $_SESSION['user_id'], is_admin_logged_in()]);
+        $stmt = $pdo->prepare("
+        SELECT m.*, u.username, u.full_name, u.account_type 
+        FROM meters m 
+        LEFT JOIN users u ON m.user_id = u.user_id 
+        WHERE m.meter_id = ? 
+        AND (m.user_id = ? OR ? = 1)
+    ");
+    $stmt->execute([$meter_id, $user_id, $is_admin]);
     $meter = $stmt->fetch();
     
     if (!$meter) {
