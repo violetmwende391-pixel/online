@@ -1,4 +1,7 @@
 <?php
+// Enable error reporting for debugging (show all errors, warnings, and notices)
+ini_set('display_errors', 1);   // Display errors in the browser
+error_reporting(E_ALL);  
 require_once 'config.php';
 // RESETT BUTTON 
 if (isset($_POST['reset_volumes'])) {
@@ -91,7 +94,7 @@ if ($supplyResult) {
 // ==============================
 $leakageHistory = [];
 $historyQuery = $pdo->prepare("
-    SELECT DATE_FORMAT(recorded_at, '%Y-%m-%d %H:%i') AS time, 
+    SELECT TO_CHAR(recorded_at, 'YYYY-MM-DD HH24:MI') AS time,
            MAX(CASE WHEN m.meter_serial = 'main_supply' THEN f.total_volume ELSE NULL END) AS supply,
            SUM(CASE WHEN m.meter_serial != 'main_supply' THEN f.total_volume ELSE 0 END) AS consumption
     FROM flow_data f
