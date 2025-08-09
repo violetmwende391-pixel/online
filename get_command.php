@@ -14,9 +14,11 @@ header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET');
 
-// Sanitize input function
-function sanitize($input) {
-    return htmlspecialchars(trim($input), ENT_QUOTES, 'UTF-8');
+// Sanitize input function (only declare if not already exists)
+if (!function_exists('sanitize')) {
+    function sanitize($input) {
+        return htmlspecialchars(trim($input), ENT_QUOTES, 'UTF-8');
+    }
 }
 
 // Validate request method
