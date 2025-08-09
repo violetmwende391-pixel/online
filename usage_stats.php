@@ -8,11 +8,12 @@ $meter_id = isset($_GET['id']) ? intval($_GET['id']) : 0;
 // Verify access
 $is_admin = is_admin_logged_in() ? 1 : 0;
 
+// FIXED: PostgreSQL-safe check
 $stmt = $pdo->prepare("
     SELECT * 
     FROM meters 
     WHERE meter_id = ? 
-      AND (user_id = ? OR COALESCE(NULLIF(?, ''), 0) = 1)
+      AND (user_id = ? OR ? = 1)
 ");
 $stmt->execute([$meter_id, $_SESSION['user_id'], $is_admin]);
 
@@ -41,19 +42,43 @@ function buildDataset($label, $data) {
     ];
 }
 
-// Queries
+// PostgreSQL-safe queries
 $params = [$meter_id, $from_date, $to_date];
-$hourly_sql = "SELECT HOUR(recorded_at) AS label, SUM(volume) AS total_volume FROM flow_data WHERE meter_id = ? AND DATE(recorded_at) BETWEEN ? AND ? GROUP BY HOUR(recorded_at) ORDER BY label";
-$daily_sql = "SELECT DATE(recorded_at) AS label, SUM(volume) AS total_volume FROM flow_data WHERE meter_id = ? AND DATE(recorded_at) BETWEEN ? AND ? GROUP BY DATE(recorded_at)";
-$weekly_sql = "SELECT YEARWEEK(recorded_at, 1) AS label, SUM(volume) AS total_volume FROM flow_data WHERE meter_id = ? AND DATE(recorded_at) BETWEEN ? AND ? GROUP BY YEARWEEK(recorded_at, 1)";
-$monthly_sql = "SELECT DATE_FORMAT(recorded_at, '%Y-%m') AS label, SUM(volume) AS total_volume FROM flow_data WHERE meter_id = ? AND DATE(recorded_at) BETWEEN ? AND ? GROUP BY DATE_FORMAT(recorded_at, '%Y-%m')";
+
+$hourly_sql = "SELECT EXTRACT(HOUR FROM recorded_at) AS label, 
+                      SUM(volume) AS total_volume 
+               FROM flow_data 
+               WHERE meter_id = ? AND DATE(recorded_at) BETWEEN ? AND ? 
+               GROUP BY EXTRACT(HOUR FROM recorded_at) 
+               ORDER BY label";
+
+$daily_sql = "SELECT DATE(recorded_at) AS label, 
+                     SUM(volume) AS total_volume 
+              FROM flow_data 
+              WHERE meter_id = ? AND DATE(recorded_at) BETWEEN ? AND ? 
+              GROUP BY DATE(recorded_at) 
+              ORDER BY label";
+
+$weekly_sql = "SELECT TO_CHAR(recorded_at, 'IYYY-IW') AS label, 
+                      SUM(volume) AS total_volume 
+               FROM flow_data 
+               WHERE meter_id = ? AND DATE(recorded_at) BETWEEN ? AND ? 
+               GROUP BY TO_CHAR(recorded_at, 'IYYY-IW') 
+               ORDER BY label";
+
+$monthly_sql = "SELECT TO_CHAR(recorded_at, 'YYYY-MM') AS label, 
+                       SUM(volume) AS total_volume 
+                FROM flow_data 
+                WHERE meter_id = ? AND DATE(recorded_at) BETWEEN ? AND ? 
+                GROUP BY TO_CHAR(recorded_at, 'YYYY-MM') 
+                ORDER BY label";
 
 $hourlyData = fetchData($pdo, $hourly_sql, $params);
 $dailyData  = fetchData($pdo, $daily_sql, $params);
 $weeklyData = fetchData($pdo, $weekly_sql, $params);
 $monthlyData = fetchData($pdo, $monthly_sql, $params);
 
-// Export
+// Export CSV
 if (isset($_GET['export']) && $_GET['export'] === 'excel') {
     header("Content-Type: text/csv");
     header("Content-Disposition: attachment; filename=water_usage.csv");
@@ -73,7 +98,8 @@ if (isset($_GET['export']) && $_GET['export'] === 'excel') {
     fclose($out);
     exit;
 }
-?><!DOCTYPE html>
+?>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -81,76 +107,19 @@ if (isset($_GET['export']) && $_GET['export'] === 'excel') {
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 20px;
-            background-color: #f0f4f8;
-            color: #333;
-        }
-        h2 {
-            color: #007bff;
-            margin-bottom: 20px;
-        }
-        form {
-            margin-bottom: 30px;
-            background: #fff;
-            padding: 15px 20px;
-            border-radius: 8px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: center;
-        }
-        label {
-            font-weight: 500;
-        }
-        button, a {
-            background-color: #007bff;
-            color: #fff !important;
-            padding: 8px 16px;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            text-decoration: none;
-        }
-        a:hover, button:hover {
-            background-color: #0056b3;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            background: #fff;
-            margin-bottom: 40px;
-            box-shadow: 0 0 5px rgba(0,0,0,0.1);
-        }
-        th, td {
-            padding: 12px;
-            border: 1px solid #ddd;
-        }
-        th {
-            background-color: #007bff;
-            color: white;
-        }
-        .chart-section {
-            background: #fff;
-            padding: 20px;
-            margin-bottom: 40px;
-            border-radius: 10px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.08);
-        }
-        .chart-container {
-            margin-top: 20px;
-        }
-        canvas {
-            max-width: 100%;
-            height: auto;
-        }
-        #monthlyChart {
-            max-width: 400px;
-            margin: 0 auto;
-            padding: 10px;
-        }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #f0f4f8; color: #333; }
+        h2 { color: #007bff; margin-bottom: 20px; }
+        form { margin-bottom: 30px; background: #fff; padding: 15px 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+        label { font-weight: 500; }
+        button, a { background-color: #007bff; color: #fff !important; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; text-decoration: none; }
+        a:hover, button:hover { background-color: #0056b3; }
+        table { width: 100%; border-collapse: collapse; background: #fff; margin-bottom: 40px; box-shadow: 0 0 5px rgba(0,0,0,0.1); }
+        th, td { padding: 12px; border: 1px solid #ddd; }
+        th { background-color: #007bff; color: white; }
+        .chart-section { background: #fff; padding: 20px; margin-bottom: 40px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.08); }
+        .chart-container { margin-top: 20px; }
+        canvas { max-width: 100%; height: auto; }
+        #monthlyChart { max-width: 400px; margin: 0 auto; padding: 10px; }
     </style>
 </head>
 <body>
@@ -185,19 +154,11 @@ printTable("Monthly Usage", $monthlyData);
 ?>
 
 <div class="chart-section">
-    <h3>Live Water Usage Charts (Refreshes every 1s)</h3>
-    <div class="chart-container">
-        <canvas id="hourlyChart"></canvas>
-    </div>
-    <div class="chart-container">
-        <canvas id="dailyChart"></canvas>
-    </div>
-    <div class="chart-container">
-        <canvas id="weeklyChart"></canvas>
-    </div>
-    <div class="chart-container">
-        <canvas id="monthlyChart"></canvas>
-    </div>
+    <h3>Live Water Usage Charts (Refreshes every 10s)</h3>
+    <div class="chart-container"><canvas id="hourlyChart"></canvas></div>
+    <div class="chart-container"><canvas id="dailyChart"></canvas></div>
+    <div class="chart-container"><canvas id="weeklyChart"></canvas></div>
+    <div class="chart-container"><canvas id="monthlyChart"></canvas></div>
 </div>
 
 <script>
@@ -217,7 +178,7 @@ function renderChart(ctxId, chartType, title, labels, data, color = 'rgba(75, 19
                 label: title,
                 data: data,
                 backgroundColor: chartType === 'pie'
-                    ? ['#007bff','#28a745','#ffc107','#dc3545'] // hourly, daily, weekly, monthly
+                    ? ['#007bff','#28a745','#ffc107','#dc3545']
                     : color,
                 borderColor: chartType === 'pie' ? '#fff' : 'rgba(0, 123, 255, 1)',
                 borderWidth: 2,
@@ -226,33 +187,14 @@ function renderChart(ctxId, chartType, title, labels, data, color = 'rgba(75, 19
         },
         options: {
             responsive: true,
-            animation: {
-                duration: 1000,
-                easing: 'easeOutQuart'
-            },
+            animation: { duration: 1000, easing: 'easeOutQuart' },
             plugins: {
-                tooltip: {
-                    callbacks: {
-                        label: function(context) {
-                            return context.label + ': ' + parseFloat(context.raw).toFixed(2) + ' L';
-                        }
-                    }
-                },
-                legend: {
-                    position: chartType === 'pie' ? 'bottom' : 'top',
-                    labels: {
-                        color: '#333'
-                    }
-                }
+                tooltip: { callbacks: { label: ctx => ctx.label + ': ' + parseFloat(ctx.raw).toFixed(2) + ' L' }},
+                legend: { position: chartType === 'pie' ? 'bottom' : 'top', labels: { color: '#333' } }
             },
             scales: chartType !== 'pie' ? {
-                y: {
-                    beginAtZero: true,
-                    title: { display: true, text: 'Volume (Liters)' }
-                },
-                x: {
-                    ticks: { color: '#555' }
-                }
+                y: { beginAtZero: true, title: { display: true, text: 'Volume (Liters)' }},
+                x: { ticks: { color: '#555' } }
             } : {}
         }
     });
@@ -267,7 +209,6 @@ async function fetchDataAndDraw() {
     if (weeklyChart) weeklyChart.destroy();
     if (monthlyChart) monthlyChart.destroy();
 
-    // Totals for pie chart
     const hourlyTotal = data.hourly.data.reduce((a, b) => a + b, 0);
     const dailyTotal = data.daily.data.reduce((a, b) => a + b, 0);
     const weeklyTotal = data.weekly.data.reduce((a, b) => a + b, 0);
@@ -276,21 +217,12 @@ async function fetchDataAndDraw() {
     hourlyChart = renderChart('hourlyChart', 'line', 'Hourly Usage (L)', data.hourly.labels, data.hourly.data);
     dailyChart  = renderChart('dailyChart', 'bar', 'Daily Usage (L)', data.daily.labels, data.daily.data);
     weeklyChart = renderChart('weeklyChart', 'line', 'Weekly Usage (L)', data.weekly.labels, data.weekly.data);
-
-    // Render improved pie chart showing all levels
-    monthlyChart = renderChart(
-        'monthlyChart',
-        'pie',
-        'Usage Distribution (Hourly, Daily, Weekly, Monthly)',
-        ['Hourly', 'Daily', 'Weekly', 'Monthly'],
-        [hourlyTotal, dailyTotal, weeklyTotal, monthlyTotal]
-    );
+    monthlyChart = renderChart('monthlyChart', 'pie', 'Usage Distribution', ['Hourly', 'Daily', 'Weekly', 'Monthly'], [hourlyTotal, dailyTotal, weeklyTotal, monthlyTotal]);
 }
 
 fetchDataAndDraw();
-setInterval(fetchDataAndDraw, 10000); // Auto-refresh every 1 second
+setInterval(fetchDataAndDraw, 10000);
 </script>
-
 
 </body>
 </html>
