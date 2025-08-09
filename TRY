@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h> 
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include <ArduinoJson.h>
@@ -36,15 +37,15 @@
 #define MIN_BALANCE_THRESHOLD 0.10   // Minimum balance to keep valve open (KES)
 
 // Watchdog Configuration
-#define WATCHDOG_TIMEOUT_SEC 60
+#define WATCHDOG_TIMEOUT_SEC 120
 
 // Network Configuration
 const char* ssid = "GalaxyA23B729";
 const char* password = "Chris1234";
-const char* serverIP = "192.168.26.121";
-const char* commandEndpoint = "/smart/get_command.php";
-const char* logEndpoint = "/smart/log_data.php";
-const char* serialEndpoint = "/smart/get_serial.php";
+const char* serverUrl = "https://smart-meter-server.onrender.com";
+const char* getCommandURL = "https://smart-meter-server.onrender.com/get_command.php?";
+const char* postDataURL = "https://smart-meter-server.onrender.com/log_data.php";
+const char* serialEndpoint = "https://smart-meter-server.onrender.com/get_serial.php";
 
 // =============================================
 // System State and Data Structures
@@ -83,7 +84,7 @@ typedef struct {
 
 // Global Variables
 MeterConfig meterConfig = {
-  .serial = "9999", // Default serial if server fails
+  .serial = "main_supply", // <- This tells the server it's the supply node
   .totalVolume = 0.0,
   .balance = 0.0, 
   .operationMode = "prepaid",
@@ -153,6 +154,10 @@ String valveStateToString(ValveState state);
 void setup() {
   Serial.begin(115200);
   delay(1000); // Allow serial to stabilize
+    // Add this for HTTPS time synchronization
+  configTime(0, 0, "pool.ntp.org"); // Sync time for HTTPS
+  Serial.println("⏰ Time synchronization initialized");
+  
   pinMode(LED_BUILTIN, OUTPUT);
   
   Serial.println("\n\n=== Water Meter Control System ===");
@@ -426,10 +431,11 @@ bool fetchMeterSerial() {
     return false;
   }
 
-  HTTPClient http;
-  String url = "http://" + String(serverIP) + serialEndpoint;
+WiFiClientSecure client;
+HTTPClient http;
+String url = serialEndpoint;
   
-  if (!http.begin(url)) {
+if (!http.begin(client, url)) {
     Serial.println("❌ Failed to begin HTTP connection");
     return false;
   }
@@ -610,12 +616,11 @@ void handleServerCommunication() {
 }
 
 bool sendToServer() {
-  HTTPClient http;
-  String url = "http://" + String(serverIP) + logEndpoint;
-  
-    // Reset watchdog before starting
-  esp_task_wdt_reset();
-  if (!http.begin(url)) {
+WiFiClientSecure client;
+HTTPClient http;
+String url = postDataURL;
+esp_task_wdt_reset(); // Reset before starting  
+if (!http.begin(client, url)) {
     Serial.println("❌ Failed to begin HTTP connection to server");
     return false;
   }
@@ -640,7 +645,8 @@ bool sendToServer() {
 
   // Send with retry logic
   for (int attempt = 0; attempt < 2; attempt++) {
-    esp_task_wdt_reset();
+  esp_task_wdt_reset();
+  
     Serial.println("📤 Attempting to send data to server...");
     int code = http.POST(json);
     esp_task_wdt_reset();
@@ -675,10 +681,11 @@ String valveStateToString(ValveState state) {
 }
 
 void checkForAdminCommand() {
-  HTTPClient http;
-  String url = "http://" + String(serverIP) + commandEndpoint + "?meter_serial=" + meterConfig.serial;
+WiFiClientSecure client;
+HTTPClient http;
+String url = String(getCommandURL) + "meter_serial=" + meterConfig.serial;
   
-  if (!http.begin(url)) {
+if (!http.begin(client, url)) {
     Serial.println("❌ Failed to begin HTTP command connection");
     return;
   }
