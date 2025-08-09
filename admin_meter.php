@@ -70,22 +70,56 @@ if (abs($flow_data['balance'] - $api_balance) > 0.01) {
 }
 
 // Process valve control form
+// Process valve control form
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['valve_action'])) {
     $action = sanitize($_POST['valve_action']);
     
     try {
-        // Add command for ESP32
-        add_command($pdo, $meter_id, 'valve', $action, $_SESSION['admin_id']);
+        // Start transaction
+        $pdo->beginTransaction();
         
-        $_SESSION['success'] = "Valve command sent successfully";
+        // First mark any existing pending commands as executed
+        $stmt = $pdo->prepare("
+            UPDATE commands 
+            SET executed = TRUE, 
+                executed_at = NOW(),
+                notes = 'Overridden by new command'
+            WHERE meter_id = ? 
+            AND command_type = 'valve' 
+            AND executed = FALSE
+        ");
+        $stmt->execute([$meter_id]);
+        
+        // Add new command for ESP32 - using PostgreSQL syntax
+        $stmt = $pdo->prepare("
+            INSERT INTO commands 
+            (meter_id, command_type, command_value, issued_by, issued_at, executed) 
+            VALUES (?, 'valve', ?, ?, NOW(), FALSE)
+            RETURNING command_id
+        ");
+        $stmt->execute([$meter_id, $action, $_SESSION['admin_id']]);
+        $command_id = $stmt->fetchColumn();
+        
+        // Also update the meter's last command timestamp
+        $stmt = $pdo->prepare("
+            UPDATE meters 
+            SET last_command_at = NOW() 
+            WHERE meter_id = ?
+        ");
+        $stmt->execute([$meter_id]);
+        
+        $pdo->commit();
+        
+        $_SESSION['success'] = "Valve command sent successfully (ID: $command_id)";
         redirect("admin_meter.php?id=$meter_id");
     } catch (PDOException $e) {
+        $pdo->rollBack();
         $_SESSION['error'] = "Failed to send command: " . $e->getMessage();
         redirect("admin_meter.php?id=$meter_id");
     }
 }
 
-// Process top-up form
+// Process top-up form - Add similar transaction handling
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
     $amount = floatval($_POST['topup_amount']);
     $method = sanitize($_POST['payment_method']);
@@ -112,12 +146,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
             $_SESSION['admin_id']
         ]);
         
-        // Add top-up command for ESP32
-        add_command($pdo, $meter_id, 'topup', $amount, $_SESSION['admin_id']);
+        // Mark any existing topup commands as executed
+        $stmt = $pdo->prepare("
+            UPDATE commands 
+            SET executed = TRUE, 
+                executed_at = NOW(),
+                notes = 'Overridden by new topup'
+            WHERE meter_id = ? 
+            AND command_type = 'topup' 
+            AND executed = FALSE
+        ");
+        $stmt->execute([$meter_id]);
+        
+        // Add new topup command
+        $stmt = $pdo->prepare("
+            INSERT INTO commands 
+            (meter_id, command_type, command_value, issued_by, issued_at, executed) 
+            VALUES (?, 'topup', ?, ?, NOW(), FALSE)
+            RETURNING command_id
+        ");
+        $stmt->execute([$meter_id, $amount, $_SESSION['admin_id']]);
+        $command_id = $stmt->fetchColumn();
         
         $pdo->commit();
         
-        $_SESSION['success'] = "Top-up of " . CURRENCY . " $amount processed successfully";
+        $_SESSION['success'] = "Top-up of " . CURRENCY . " $amount processed successfully (Command ID: $command_id)";
         redirect("admin_meter.php?id=$meter_id");
         
     } catch (PDOException $e) {
@@ -126,6 +179,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
         redirect("admin_meter.php?id=$meter_id");
     }
 }
+
+// ... [rest of your HTML remains exactly the same] ...
 ?>
 
 <!DOCTYPE html>

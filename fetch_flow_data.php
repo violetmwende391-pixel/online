@@ -1,5 +1,6 @@
 <?php
 require_once 'config.php';
+require_once 'functions.php';
 
 header('Content-Type: application/json');
 
@@ -14,53 +15,53 @@ $meter_id = (int)$_GET['meter_id'];
 
 try {
     // Get latest flow data
-    $stmt = $pdo->prepare("
-        SELECT 
-            flow_rate, 
-            volume, 
-            total_volume, 
-            balance, 
-            valve_status 
-        FROM flow_data 
-        WHERE meter_id = ? 
-        ORDER BY recorded_at DESC 
-        LIMIT 1
-    ");
-    $stmt->execute([$meter_id]);
-    $flow_data = $stmt->fetch(PDO::FETCH_ASSOC);
-
+    $flow_data = get_latest_flow_data($pdo, $meter_id);
+    
     if (!$flow_data) {
         // If no data exists, get basic meter info
         $stmt = $pdo->prepare("
             SELECT 
-                m.meter_id,
-                COALESCE(SUM(p.amount), 0) - COALESCE(MAX(f.total_volume), 0) as balance
-            FROM meters m
-            LEFT JOIN payments p ON p.meter_id = m.meter_id
-            LEFT JOIN flow_data f ON f.meter_id = m.meter_id
-            WHERE m.meter_id = ?
-            GROUP BY m.meter_id
+                COALESCE(SUM(amount), 0) as total_payments 
+            FROM payments 
+            WHERE meter_id = ?
         ");
         $stmt->execute([$meter_id]);
-        $meter_info = $stmt->fetch(PDO::FETCH_ASSOC);
-
+        $total_payments = (float)$stmt->fetchColumn();
+        
         $flow_data = [
             'flow_rate' => 0,
             'volume' => 0,
             'total_volume' => 0,
-            'balance' => $meter_info['balance'] ?? 0,
+            'balance' => $total_payments,
             'valve_status' => 'closed'
         ];
     }
 
-    echo json_encode([
+    // Add pending command info
+    $stmt = $pdo->prepare("
+        SELECT command_type, command_value 
+        FROM commands 
+        WHERE meter_id = ? AND executed = FALSE
+        ORDER BY issued_at DESC 
+        LIMIT 1
+    ");
+    $stmt->execute([$meter_id]);
+    $pending_command = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    $response = [
         'status' => 'success',
         'flow_rate' => (float)$flow_data['flow_rate'],
         'volume' => (float)$flow_data['volume'],
         'total_volume' => (float)$flow_data['total_volume'],
         'balance' => (float)$flow_data['balance'],
         'valve_status' => $flow_data['valve_status']
-    ]);
+    ];
+    
+    if ($pending_command) {
+        $response['pending_command'] = $pending_command;
+    }
+
+    echo json_encode($response);
 
 } catch (PDOException $e) {
     http_response_code(500);
