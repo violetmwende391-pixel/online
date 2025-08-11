@@ -1,4 +1,3 @@
-get_command.php
 <?php
 require_once 'config.php';
 
@@ -176,3 +175,7 @@ try {
     echo json_encode($response);
 }
 ?>
+
+
+
+
