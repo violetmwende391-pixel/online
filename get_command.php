@@ -1,4 +1,3 @@
- 
 <?php
 require_once 'config.php';
 
@@ -55,7 +54,7 @@ try {
     $pdo->beginTransaction();
     
     $stmt = $pdo->prepare("
-        SELECT meter_id, status, operation_mode, current_valve_state 
+        SELECT meter_id, status, control_mode, current_valve_state 
         FROM meters 
         WHERE meter_serial = ? 
         LIMIT 1
@@ -113,7 +112,7 @@ try {
         'mode' => '',
         'meter_status' => $meter['status'],
         'current_valve_state' => $meter['current_valve_state'],
-        'operation_mode' => $meter['operation_mode']
+        'control_mode' => $meter['control_mode']
     ];
 
     // Check for pending commands (not executed and not acknowledged)
