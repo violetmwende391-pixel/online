@@ -37,7 +37,7 @@
 #define MIN_BALANCE_THRESHOLD 0.10   // Minimum balance to keep valve open (KES)
 
 // Watchdog Configuration
-#define WATCHDOG_TIMEOUT_SEC 120
+#define WATCHDOG_TIMEOUT_SEC 60
 
 // Network Configuration
 const char* ssid = "GalaxyA23B729";
@@ -154,10 +154,6 @@ String valveStateToString(ValveState state);
 void setup() {
   Serial.begin(115200);
   delay(1000); // Allow serial to stabilize
-    // Add this for HTTPS time synchronization
-  configTime(0, 0, "pool.ntp.org"); // Sync time for HTTPS
-  Serial.println("⏰ Time synchronization initialized");
-  
   pinMode(LED_BUILTIN, OUTPUT);
   
   Serial.println("\n\n=== Water Meter Control System ===");
@@ -236,6 +232,7 @@ void loop() {
     }
     systemState.lastLoopTime = now;
   }
+  esp_task_wdt_reset();
 
   // 2. Calculate and process flow data
   if (now - systemState.lastLoopTime > FLOW_CALC_INTERVAL) {
@@ -281,6 +278,7 @@ void loop() {
     }
     lastCommandTime = now;
   }
+   esp_task_wdt_reset();
 
 }
 
@@ -616,11 +614,12 @@ void handleServerCommunication() {
 }
 
 bool sendToServer() {
-WiFiClientSecure client;
-HTTPClient http;
-String url = postDataURL;
-esp_task_wdt_reset(); // Reset before starting  
-if (!http.begin(client, url)) {
+  HTTPClient http;
+  String url = postDataURL; // Use the full URL you defined
+  
+    // Reset watchdog before starting
+  esp_task_wdt_reset();
+  if (!http.begin(url)) {
     Serial.println("❌ Failed to begin HTTP connection to server");
     return false;
   }
@@ -642,11 +641,11 @@ if (!http.begin(client, url)) {
 
   String json;
   serializeJson(doc, json);
+  esp_task_wdt_reset();
 
   // Send with retry logic
   for (int attempt = 0; attempt < 2; attempt++) {
-  esp_task_wdt_reset();
-  
+    esp_task_wdt_reset();
     Serial.println("📤 Attempting to send data to server...");
     int code = http.POST(json);
     esp_task_wdt_reset();
@@ -681,11 +680,10 @@ String valveStateToString(ValveState state) {
 }
 
 void checkForAdminCommand() {
-WiFiClientSecure client;
-HTTPClient http;
-String url = String(getCommandURL) + "meter_serial=" + meterConfig.serial;
+  HTTPClient http;
+  String url = String(getCommandURL) + "meter_serial=" + meterConfig.serial;
   
-if (!http.begin(client, url)) {
+  if (!http.begin(url)) {
     Serial.println("❌ Failed to begin HTTP command connection");
     return;
   }
