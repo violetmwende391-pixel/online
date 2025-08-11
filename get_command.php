@@ -4,10 +4,22 @@ require_once 'config.php';
 // Set default timezone
 date_default_timezone_set('Africa/Nairobi');
 
+// Define environment if not already defined
+if (!defined('ENVIRONMENT')) {
+    define('ENVIRONMENT', 'development');
+}
+
 // Set response headers
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET');
+
+// Sanitize input function (only declare if not already exists)
+if (!function_exists('sanitize')) {
+    function sanitize($input) {
+        return htmlspecialchars(trim($input), ENT_QUOTES, 'UTF-8');
+    }
+}
 
 // Validate request method
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
@@ -23,7 +35,14 @@ if (empty($_GET['meter_serial'])) {
     exit;
 }
 
-$meter_serial = htmlspecialchars(trim($_GET['meter_serial']), ENT_QUOTES, 'UTF-8');
+$meter_serial = sanitize($_GET['meter_serial']);
+
+// Validate meter serial format
+if (!preg_match('/^[A-Z0-9_-]{4,30}$/i', $meter_serial)) {
+    http_response_code(400);
+    echo json_encode(['status' => 'error', 'error' => 'Invalid meter serial format']);
+    exit;
+}
 
 try {
     // Verify database connection
@@ -59,7 +78,7 @@ try {
 
     $meter_id = $meter['meter_id'];
 
-    // Calculate balance (matches ESP32 expectation)
+    // Calculate balance
     $stmt = $pdo->prepare("
         SELECT COALESCE(SUM(amount), 0) 
         FROM payments 
@@ -80,7 +99,7 @@ try {
 
     $balance = $total_payments - $total_volume;
 
-    // Prepare base response (matches exactly what ESP32 processes)
+    // Prepare base response
     $response = [
         'status' => 'success',
         'balance' => round($balance, 2),
@@ -89,54 +108,71 @@ try {
         'meter_status' => $meter['status']
     ];
 
-    // SIMPLIFIED COMMAND FETCH - matches ESP32's simple processing
+    // Process commands in transaction
+// Replace the command processing section with this:
+
+// Process commands in transaction
+$pdo->beginTransaction();
+
+try {
+    // Get oldest unexecuted command (with SKIP LOCKED for PostgreSQL)
     $stmt = $pdo->prepare("
-        SELECT command_type, command_value 
+        SELECT command_id, command_type, command_value 
         FROM commands 
         WHERE meter_id = ? 
-        AND executed = FALSE
+        AND executed = FALSE 
         ORDER BY issued_at ASC 
-        LIMIT 1
+        LIMIT 1 
+        FOR UPDATE SKIP LOCKED
     ");
     $stmt->execute([$meter_id]);
     $command = $stmt->fetch(PDO::FETCH_ASSOC);
 
+    $response = [
+        'status' => 'success',
+        'balance' => round($balance, 2),
+        'valve_command' => '',
+        'mode' => '',
+        'meter_status' => $meter['status']
+    ];
+
     if ($command) {
-        // Add command to response (ESP32 looks for these exact fields)
+        error_log("Found pending command: " . json_encode($command));
+        
+        // Add command to response
         if ($command['command_type'] === 'valve') {
             $response['valve_command'] = $command['command_value'];
         } elseif ($command['command_type'] === 'mode') {
             $response['mode'] = $command['command_value'];
         }
 
-        // Mark command as executed immediately (since ESP32 doesn't acknowledge)
+        // Mark command as executed
         $update = $pdo->prepare("
             UPDATE commands 
             SET executed = TRUE, 
                 executed_at = NOW() 
-            WHERE meter_id = ? 
-            AND command_type = ? 
-            AND command_value = ?
-            AND executed = FALSE
+            WHERE command_id = ?
         ");
-        $update->execute([
-            $meter_id,
-            $command['command_type'],
-            $command['command_value']
-        ]);
+        $update->execute([$command['command_id']]);
+        
+        error_log("Marked command {$command['command_id']} as executed");
     }
 
-    // Send response (format exactly matches ESP32 expectations)
+    $pdo->commit();
     echo json_encode($response);
+    
+} catch (Exception $e) {
+    $pdo->rollBack();
+    throw $e;
+}
 
-} catch (PDOException $e) {
     http_response_code(500);
     error_log("get_command.php error: " . $e->getMessage());
 
     $response = [
         'status' => 'error',
         'error' => 'Database error',
-        'details' => (defined('ENVIRONMENT') && ENVIRONMENT === 'development') ? $e->getMessage() : null
+        'details' => (ENVIRONMENT === 'development') ? $e->getMessage() : null
     ];
     echo json_encode($response);
     
@@ -147,7 +183,7 @@ try {
     $response = [
         'status' => 'error',
         'error' => 'Server error',
-        'details' => (defined('ENVIRONMENT') && ENVIRONMENT === 'development') ? $e->getMessage() : null
+        'details' => (ENVIRONMENT === 'development') ? $e->getMessage() : null
     ];
     echo json_encode($response);
 }
