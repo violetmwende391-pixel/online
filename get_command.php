@@ -54,7 +54,7 @@ try {
     $pdo->beginTransaction();
     
     $stmt = $pdo->prepare("
-        SELECT meter_id, status, control_mode, current_valve_state 
+        SELECT meter_id, status, control_mode
         FROM meters 
         WHERE meter_serial = ? 
         LIMIT 1
@@ -111,7 +111,7 @@ try {
         'valve_command' => '',
         'mode' => '',
         'meter_status' => $meter['status'],
-        'current_valve_state' => $meter['current_valve_state'],
+        'current_valve_state' => $meter['status'], // reuse status as valve state
         'control_mode' => $meter['control_mode']
     ];
 
