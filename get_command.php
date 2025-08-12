@@ -12,7 +12,15 @@ if (!defined('ENVIRONMENT')) {
 // Set response headers
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET');
+// Allow POST because ESP32 will POST confirmation to this same endpoint
+header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, Accept');
+
+// Handle CORS preflight
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit;
+}
 
 // Sanitize input function (only declare if not already exists)
 if (!function_exists('sanitize')) {
@@ -21,30 +29,60 @@ if (!function_exists('sanitize')) {
     }
 }
 
-// Validate request method
-if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
-    http_response_code(405);
-    echo json_encode(['status' => 'error', 'error' => 'Method not allowed']);
-    exit;
-}
-
-// Validate meter_serial parameter
-if (empty($_GET['meter_serial'])) {
-    http_response_code(400);
-    echo json_encode(['status' => 'error', 'error' => 'Meter serial number is required']);
-    exit;
-}
-
-$meter_serial = sanitize($_GET['meter_serial']);
-
-// Validate meter serial format
-if (!preg_match('/^[A-Z0-9_-]{4,30}$/i', $meter_serial)) {
-    http_response_code(400);
-    echo json_encode(['status' => 'error', 'error' => 'Invalid meter serial format']);
-    exit;
-}
-
 try {
+    // ----- POST: confirmation handler (mark command executed) -----
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $data = json_decode(file_get_contents("php://input"), true);
+
+        if (empty($data['command_id']) || !is_numeric($data['command_id'])) {
+            http_response_code(400);
+            echo json_encode(['status' => 'error', 'error' => 'command_id is required']);
+            exit;
+        }
+
+        if (!isset($pdo)) {
+            throw new PDOException('Database connection not initialized');
+        }
+
+        $stmt = $pdo->prepare("
+            UPDATE commands 
+            SET executed = TRUE, executed_at = NOW()
+            WHERE command_id = ? AND executed = FALSE
+        ");
+        $stmt->execute([(int)$data['command_id']]);
+
+        if ($stmt->rowCount() > 0) {
+            echo json_encode(['status' => 'success', 'message' => 'Command marked executed']);
+        } else {
+            // Either command doesn't exist, already executed, or wrong id
+            echo json_encode(['status' => 'warning', 'message' => 'Command not updated (may already be executed or not exist)']);
+        }
+        exit;
+    }
+
+    // ----- GET: original behavior (fetch command) -----
+    if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+        http_response_code(405);
+        echo json_encode(['status' => 'error', 'error' => 'Method not allowed']);
+        exit;
+    }
+
+    // Validate meter_serial parameter
+    if (empty($_GET['meter_serial'])) {
+        http_response_code(400);
+        echo json_encode(['status' => 'error', 'error' => 'Meter serial number is required']);
+        exit;
+    }
+
+    $meter_serial = sanitize($_GET['meter_serial']);
+
+    // Validate meter serial format
+    if (!preg_match('/^[A-Z0-9_-]{4,30}$/i', $meter_serial)) {
+        http_response_code(400);
+        echo json_encode(['status' => 'error', 'error' => 'Invalid meter serial format']);
+        exit;
+    }
+
     // Verify database connection
     if (!isset($pdo)) {
         throw new PDOException('Database connection not initialized');
@@ -108,10 +146,11 @@ try {
         'meter_status' => $meter['status']
     ];
 
-    // Process commands in transaction
+    // Process commands
+    // NOTE: We DO NOT mark commands as executed here. We send the command + command_id to the device.
+    // The hardware must POST back with that command_id to confirm actual execution.
     $pdo->beginTransaction();
 
-    // Get oldest unexecuted command (with SKIP LOCKED for PostgreSQL)
     $stmt = $pdo->prepare("
         SELECT command_id, command_type, command_value 
         FROM commands 
@@ -125,21 +164,15 @@ try {
     $command = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if ($command) {
-        // Add command to response
+        // Add command to response but DO NOT mark as executed here.
         if ($command['command_type'] === 'valve') {
             $response['valve_command'] = $command['command_value'];
         } elseif ($command['command_type'] === 'mode') {
             $response['mode'] = $command['command_value'];
         }
 
-        // Mark command as executed
-        $update = $pdo->prepare("
-            UPDATE commands 
-            SET executed = TRUE, 
-                executed_at = NOW() 
-            WHERE command_id = ?
-        ");
-        $update->execute([$command['command_id']]);
+        // Send ID so ESP32 can confirm later (hardware will POST this id back)
+        $response['command_id'] = (int)$command['command_id'];
     }
 
     $pdo->commit();
@@ -162,11 +195,11 @@ try {
         'details' => (ENVIRONMENT === 'development') ? $e->getMessage() : null
     ];
     echo json_encode($response);
-    
+
 } catch (Exception $e) {
     http_response_code(500);
     error_log("get_command.php error: " . $e->getMessage());
-    
+
     $response = [
         'status' => 'error',
         'error' => 'Server error',
@@ -179,3 +212,4 @@ try {
 
 
 
+ 
