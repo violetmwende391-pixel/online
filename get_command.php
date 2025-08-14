@@ -31,6 +31,7 @@ if (!function_exists('sanitize')) {
 
 try {
     // ----- POST: confirmation handler (mark command executed) -----
+    // Keep POST confirmation for non-valve commands
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $data = json_decode(file_get_contents("php://input"), true);
 
@@ -44,8 +45,9 @@ try {
             throw new PDOException('Database connection not initialized');
         }
 
+        // Mark the specific command as executed (for non-valve or manual cases)
         $stmt = $pdo->prepare("
-            UPDATE commands 
+            UPDATE commands
             SET executed = TRUE, executed_at = NOW()
             WHERE command_id = ? AND executed = FALSE
         ");
@@ -54,13 +56,12 @@ try {
         if ($stmt->rowCount() > 0) {
             echo json_encode(['status' => 'success', 'message' => 'Command marked executed']);
         } else {
-            // Either command doesn't exist, already executed, or wrong id
             echo json_encode(['status' => 'warning', 'message' => 'Command not updated (may already be executed or not exist)']);
         }
         exit;
     }
 
-    // ----- GET: original behavior (fetch command) -----
+    // ----- GET: fetch command -----
     if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
         http_response_code(405);
         echo json_encode(['status' => 'error', 'error' => 'Method not allowed']);
@@ -146,32 +147,31 @@ try {
         'meter_status' => $meter['status']
     ];
 
-    // Process commands
-    // NOTE: We DO NOT mark commands as executed here. We send the command + command_id to the device.
-    // The hardware must POST back with that command_id to confirm actual execution.
-    $pdo->beginTransaction();
+    // Auto-mark valve commands older than 6 seconds as executed
+    $pdo->prepare("
+        UPDATE commands
+        SET executed = TRUE, executed_at = NOW()
+        WHERE command_type = 'valve'
+          AND executed = FALSE
+          AND issued_at <= NOW() - INTERVAL 6 SECOND
+    ")->execute();
 
+    // Fetch the latest unexecuted valve command only
+    $pdo->beginTransaction();
     $stmt = $pdo->prepare("
-        SELECT command_id, command_type, command_value 
-        FROM commands 
-        WHERE meter_id = ? 
-        AND executed = FALSE 
-        ORDER BY issued_at ASC 
-        LIMIT 1 
-        FOR UPDATE SKIP LOCKED
+        SELECT command_id, command_type, command_value
+        FROM commands
+        WHERE meter_id = ?
+          AND executed = FALSE
+          AND command_type = 'valve'
+        ORDER BY issued_at DESC
+        LIMIT 1
     ");
     $stmt->execute([$meter_id]);
     $command = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if ($command) {
-        // Add command to response but DO NOT mark as executed here.
-        if ($command['command_type'] === 'valve') {
-            $response['valve_command'] = $command['command_value'];
-        } elseif ($command['command_type'] === 'mode') {
-            $response['mode'] = $command['command_value'];
-        }
-
-        // Send ID so ESP32 can confirm later (hardware will POST this id back)
+        $response['valve_command'] = $command['command_value'];
         $response['command_id'] = (int)$command['command_id'];
     }
 
@@ -181,14 +181,11 @@ try {
     echo json_encode($response);
 
 } catch (PDOException $e) {
-    // Rollback transaction if active
     if (isset($pdo) && $pdo->inTransaction()) {
         $pdo->rollBack();
     }
-
     http_response_code(500);
     error_log("get_command.php error: " . $e->getMessage());
-
     $response = [
         'status' => 'error',
         'error' => 'Database error',
@@ -199,7 +196,6 @@ try {
 } catch (Exception $e) {
     http_response_code(500);
     error_log("get_command.php error: " . $e->getMessage());
-
     $response = [
         'status' => 'error',
         'error' => 'Server error',
@@ -209,6 +205,10 @@ try {
 }
 ?>
 
+
+
+
+ 
 
 
 
