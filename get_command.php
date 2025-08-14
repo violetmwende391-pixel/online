@@ -153,7 +153,7 @@ try {
         SET executed = TRUE, executed_at = NOW()
         WHERE command_type = 'valve'
           AND executed = FALSE
-          AND issued_at <= NOW() - INTERVAL 6 SECOND
+          AND issued_at <= NOW() - INTERVAL '6 SECOND
     ")->execute();
 
     // Fetch the latest unexecuted valve command only
@@ -212,4 +212,6 @@ try {
 
 
 
- 
+  git add get_command.php
+git commit -m "Update get_command.php"
+git push
