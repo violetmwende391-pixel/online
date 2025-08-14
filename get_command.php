@@ -212,6 +212,4 @@ try {
 
 
 
-  git add get_command.php
-git commit -m "Update get_command.php"
-git push
+ 
