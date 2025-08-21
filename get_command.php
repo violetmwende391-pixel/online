@@ -192,7 +192,6 @@ try {
         'details' => (ENVIRONMENT === 'development') ? $e->getMessage() : null
     ];
     echo json_encode($response);
-
 } catch (Exception $e) {
     http_response_code(500);
     error_log("get_command.php error: " . $e->getMessage());
@@ -204,11 +203,3 @@ try {
     echo json_encode($response);
 }
 ?>
-
-
-
-
- 
-
-
- 
