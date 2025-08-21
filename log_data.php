@@ -102,7 +102,22 @@ try {
     $meter_id = $meter['meter_id'];
 
     // Calculate balance if not provided (for backward compatibility)
-    $balance = $data['balance'] ?? 0;
+   // Calculate new balance (Option B logic)
+if (isset($data['balance'])) {
+    // If balance is provided explicitly, use it (backward compatibility)
+    $balance = floatval($data['balance']);
+} else {
+    // Otherwise, calculate balance based on last record
+    $stmt = $pdo->prepare("SELECT balance FROM flow_data WHERE meter_id = ? ORDER BY recorded_at DESC LIMIT 1");
+    $stmt->execute([$meter_id]);
+    $last = $stmt->fetch();
+
+    $previousBalance = $last ? floatval($last['balance']) : 0;
+
+    // Deduct the new session volume
+    $balance = $previousBalance - floatval($data['volume']);
+}
+
     
     // Insert flow data with additional validation
     $sql = "INSERT INTO flow_data 
