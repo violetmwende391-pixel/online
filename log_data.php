@@ -10,6 +10,7 @@ $debugData = [
     'headers' => getallheaders(),
     'raw_input' => file_get_contents('php://input')
 ];
+
 // Set response content type to JSON
 header('Content-Type: application/json');
 
@@ -27,10 +28,10 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 $rawInput = file_get_contents('php://input');
 $data = json_decode($rawInput, true);
 file_put_contents('log.txt', $rawInput . PHP_EOL, FILE_APPEND);
+
 // Enhanced JSON debug logging
 $debugData['json_data'] = $data;
 $debugData['json_last_error'] = json_last_error_msg();
-
 
 // Handle invalid JSON
 if (!is_array($data)) {
@@ -41,7 +42,8 @@ if (!is_array($data)) {
     ]);
     exit;
 }
-//Log the received flow data specifically
+
+// Log the received flow data specifically
 $flowDebug = [
     'flow_rate' => $data['flow'] ?? 'NOT RECEIVED',
     'volume' => $data['volume'] ?? 'NOT RECEIVED',
@@ -49,6 +51,7 @@ $flowDebug = [
     'valve_status' => $data['valve_status'] ?? 'NOT RECEIVED'
 ];
 file_put_contents('flow_debug.txt', print_r($flowDebug, true) . PHP_EOL, FILE_APPEND);
+
 // Define required fields
 $required = ['flow', 'volume', 'total_volume', 'valve_status', 'meter_serial'];
 
@@ -101,25 +104,30 @@ try {
 
     $meter_id = $meter['meter_id'];
 
-    // Calculate balance if not provided (for backward compatibility)
-   // Calculate new balance (Option B logic)
-if (isset($data['balance'])) {
-    // If balance is provided explicitly, use it (backward compatibility)
-    $balance = floatval($data['balance']);
-} else {
-    // Otherwise, calculate balance based on last record
-    $stmt = $pdo->prepare("SELECT balance FROM flow_data WHERE meter_id = ? ORDER BY recorded_at DESC LIMIT 1");
+    // ---------------- BALANCE CALCULATION ----------------
+    // Step 1: Get total payments for this meter
+    $stmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) as total_paid 
+                           FROM payments 
+                           WHERE meter_id = ?");
     $stmt->execute([$meter_id]);
-    $last = $stmt->fetch();
+    $paymentRow = $stmt->fetch();
+    $total_paid = $paymentRow ? floatval($paymentRow['total_paid']) : 0;
 
-    $previousBalance = $last ? floatval($last['balance']) : 0;
+    // Step 2: Get last balance from flow_data
+    $stmt = $pdo->prepare("SELECT balance 
+                           FROM flow_data 
+                           WHERE meter_id = ? 
+                           ORDER BY recorded_at DESC 
+                           LIMIT 1");
+    $stmt->execute([$meter_id]);
+    $lastRow = $stmt->fetch();
+    $last_balance = $lastRow ? floatval($lastRow['balance']) : $total_paid;
 
-    // Deduct the new session volume
-    $balance = $previousBalance - floatval($data['volume']);
-}
+    // Step 3: Subtract this new session volume
+    $balance = $last_balance - floatval($data['volume']);
+    // ------------------------------------------------------
 
-    
-    // Insert flow data with additional validation
+    // Insert flow data
     $sql = "INSERT INTO flow_data 
             (meter_id, flow_rate, volume, total_volume, balance, valve_status, recorded_at) 
             VALUES (?, ?, ?, ?, ?, ?, NOW())";
@@ -127,11 +135,11 @@ if (isset($data['balance'])) {
     $stmt = $pdo->prepare($sql);
     $success = $stmt->execute([
         $meter_id,
-        floatval($data['flow']),    // Flow rate in L/min
-        floatval($data['volume']),  // Session volume in liters
-        floatval($data['total_volume']), // Total volume in liters
-        floatval($balance),         // Current balance
-        $data['valve_status']       // Valve status
+        floatval($data['flow']),          // Flow rate in L/min
+        floatval($data['volume']),        // Session volume in liters
+        floatval($data['total_volume']),  // Total volume in liters
+        floatval($balance),               // Calculated balance
+        $data['valve_status']             // Valve status
     ]);
 
     if ($success) {
@@ -139,7 +147,7 @@ if (isset($data['balance'])) {
         $updateStmt = $pdo->prepare("UPDATE meters SET last_activity = NOW() WHERE meter_id = ?");
         $updateStmt->execute([$meter_id]);
         
-        // Success response with additional data
+        // Success response
         http_response_code(200);
         echo json_encode([
             'status' => 'success',
@@ -171,7 +179,6 @@ if (isset($data['balance'])) {
         'error' => 'Database error'
     ];
     
-    // Include error details in development environment
     if (defined('ENVIRONMENT') && ENVIRONMENT === 'development') {
         $response['details'] = $e->getMessage();
         $response['trace'] = $e->getTrace();
@@ -179,7 +186,7 @@ if (isset($data['balance'])) {
     
     echo json_encode($response);
 }
+
 file_put_contents('log.txt', $rawInput . PHP_EOL, FILE_APPEND);
-// Final debug log
 file_put_contents($logFile, json_encode($debugData, JSON_PRETTY_PRINT) . PHP_EOL, FILE_APPEND);
 ?>
