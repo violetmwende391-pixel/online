@@ -104,28 +104,11 @@ try {
 
     $meter_id = $meter['meter_id'];
 
-    // ---------------- BALANCE CALCULATION ----------------
-    // Step 1: Get total payments for this meter
-    $stmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) as total_paid 
-                           FROM payments 
-                           WHERE meter_id = ?");
-    $stmt->execute([$meter_id]);
-    $paymentRow = $stmt->fetch();
-    $total_paid = $paymentRow ? floatval($paymentRow['total_paid']) : 0;
 
-    // Step 2: Get last balance from flow_data
-    $stmt = $pdo->prepare("SELECT balance 
-                           FROM flow_data 
-                           WHERE meter_id = ? 
-                           ORDER BY recorded_at DESC 
-                           LIMIT 1");
-    $stmt->execute([$meter_id]);
-    $lastRow = $stmt->fetch();
-    $last_balance = $lastRow ? floatval($lastRow['balance']) : $total_paid;
+ // Use the balance reported by the device (slave) directly
+$balance = isset($data['balance']) ? floatval($data['balance']) : 0.00;
 
-    // Step 3: Subtract this new session volume
-    $balance = $last_balance - floatval($data['volume']);
-    // ------------------------------------------------------
+
 
     // Insert flow data
     $sql = "INSERT INTO flow_data 
