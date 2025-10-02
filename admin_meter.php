@@ -36,7 +36,11 @@ $stmt = $pdo->prepare("SELECT SUM(amount) FROM payments WHERE meter_id = ?");
 $stmt->execute([$meter_id]);
 $total_topup = $stmt->fetchColumn() ?? 0;
 
-$flow_data['balance'] = $total_topup - $total_volume;
+if (!isset($flow_data['balance']) || $flow_data['balance'] === null) {
+    // Fallback calculation only if balance is missing
+    $flow_data['balance'] = $total_topup - $total_volume;
+}
+
 
 
 // After calculating balance
