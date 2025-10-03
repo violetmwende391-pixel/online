@@ -149,6 +149,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
             $transaction_code,
             $_SESSION['admin_id']
         ]);
+<<<<<<< HEAD
                 // Update latest balance in flow_data (Quick Fix Option A)
         $stmt = $pdo->prepare("
             UPDATE flow_data
@@ -159,6 +160,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
         ");
         $stmt->execute([$amount, $meter_id]);
 
+=======
+>>>>>>> d381793d24c78a2fca36f9fab82a0551fc2fe2f8
         
         // Mark any existing topup commands as executed
         $stmt = $pdo->prepare("

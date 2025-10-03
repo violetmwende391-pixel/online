@@ -1,0 +1,1245 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
+#include <ArduinoJson.h>
+
+// =============================================
+// Hardware Configuration
+// =============================================
+
+// LoRa Pins
+#define SCK 5
+#define MISO 19
+#define MOSI 27
+#define SS 18
+#define RST 14
+#define DIO0 26
+#define BAND 923E6  // 433E6 for Asia, 866E6 for Europe, 915E6 for NA
+
+
+// Flow Sensor and Valve Pins
+#define FLOW_SENSOR_PIN 34
+#define VALVE_ENABLE_PIN 13
+#define VALVE_IN1_PIN 25
+#define VALVE_IN2_PIN 12
+#define LED_BUILTIN 2
+
+#define VALVE_OPEN_PULSE_MS 8000  // Extended opening time (8 seconds)
+#define VALVE_CLOSE_PULSE_MS 8000 // Extended closing time
+#define VALVE_HOLD_POWER_MS 200   // Brief power after movement
+#define VALVE_DEBOUNCE_INTERVAL 10000 // Minimum time between valve changes
+
+// =============================================
+// System Configuration
+// =============================================
+
+#define FLOW_CALIBRATION 7.5
+#define DEBOUNCE_TIME 10
+#define VALVE_OPERATION_TIME 5000
+#define VALVE_DEBOUNCE_INTERVAL 10000
+#define FLOW_CALC_INTERVAL 1000
+#define LORA_SEND_INTERVAL 5000
+#define COMMAND_CHECK_INTERVAL 2000
+#define SAVE_INTERVAL 30000
+#define MANUAL_OVERRIDE_TIMEOUT 30000
+#define PRICE_PER_LITER 1.0
+#define MIN_BALANCE_THRESHOLD 0.10
+#define WATCHDOG_TIMEOUT_SEC 60
+#define LORA_RETRY_INTERVAL 30000
+#define RECEIVE_WINDOW_MS 1000 
+
+
+
+// Track LoRa config for printing (because library getters aren't public)
+const int   LORA_SF = 9;
+const long  LORA_BW = 125E3;
+const int   LORA_CR4 = 5;
+
+
+// =============================================
+// Data Structures
+// =============================================
+
+enum ValveState { 
+  CLOSED, 
+  OPENING, 
+  OPEN, 
+  CLOSING,
+  ERROR_STUCK,
+  ERROR_TIMEOUT
+};
+
+typedef struct {
+  char serial[32];
+  float totalVolume;
+  float balance;
+  String operationMode;
+  ValveState valveState;
+  bool manualControl;
+} MeterConfig;
+
+typedef struct {
+  volatile unsigned long pulseCount;
+  unsigned long lastPulseTime; 
+  float flowRate;
+  float sessionVolume;
+  unsigned long lastValveAction;
+  unsigned long manualCommandTime;
+  unsigned long lastLoopTime;
+  unsigned long lastLoraAttempt;
+} SystemState;
+
+
+// ---- Forward declarations ----
+void calculateFlowRate();
+void manageValve();
+void openValve();
+void closeValve();
+bool sendLoRaData();
+void receiveLoRaCommand();
+void processLoRaCommand(String packet);
+String valveStateToString(ValveState state);
+void changeOperationMode(const char* mode);
+void handleAutomaticValveControl(float balance);
+void performSystemMaintenance();
+void printSystemStatus();
+
+
+// =============================================
+// Global Variables
+// =============================================
+
+MeterConfig meterConfig = {
+  .serial = "LORA_SLAVE_1", // Will be updated with device ID
+  .totalVolume = 0.0,
+  .balance = 0.0, 
+  .operationMode = "prepaid",
+  .valveState = CLOSED,
+  .manualControl = false
+};
+
+SystemState systemState = {
+  .pulseCount = 0,
+  .lastPulseTime = 0,
+  .flowRate = 0.0,
+  .sessionVolume = 0.0,
+  .lastValveAction = 0,
+  .manualCommandTime = 0,
+  .lastLoopTime = 0,
+  .lastLoraAttempt = 0
+};
+
+Preferences preferences;
+
+// =============================================
+// Interrupt Service Routine
+// =============================================
+
+void IRAM_ATTR pulseCounter() {
+  unsigned long now = millis();
+  if (now - systemState.lastLoopTime > DEBOUNCE_TIME) {
+    systemState.pulseCount++;
+    systemState.lastLoopTime = now;
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  }
+}
+
+// =============================================
+// Core Functions
+// =============================================
+
+String getDeviceID() {
+  uint64_t chipid = ESP.getEfuseMac();
+  char id[13];
+  sprintf(id, "%04X%08X", (uint16_t)(chipid >> 32), (uint32_t)chipid);
+  return String(id);
+}
+
+void initializeHardware() {
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(VALVE_ENABLE_PIN, OUTPUT);
+  pinMode(VALVE_IN1_PIN, OUTPUT);
+  pinMode(VALVE_IN2_PIN, OUTPUT);
+  digitalWrite(VALVE_ENABLE_PIN, LOW);
+  
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), pulseCounter, RISING);
+  Serial.println("✅ Hardware initialized");
+}
+
+void initializeLoRa() {
+  SPI.begin(SCK, MISO, MOSI, SS);
+  LoRa.setPins(SS, RST, DIO0);
+  
+  if (!LoRa.begin(BAND)) {
+    Serial.println("Starting LoRa failed!");
+    while (1);
+  }
+  
+  // Enhanced configuration
+LoRa.setTxPower(20);
+LoRa.setSpreadingFactor(LORA_SF);
+LoRa.setSignalBandwidth(LORA_BW);
+LoRa.setCodingRate4(LORA_CR4);
+LoRa.enableCrc();
+LoRa.setSyncWord(0xF3);
+LoRa.enableCrc();
+LoRa.receive(); // Put radio in receive mode
+  
+
+Serial.println("✅ LoRa Initialized");
+Serial.print("Frequency: "); Serial.print(BAND/1E6); Serial.println("MHz");
+// PRINT YOUR OWN VALUES INSTEAD OF CALLING PRIVATE GETTERS
+Serial.print("Spread Factor: "); Serial.println(LORA_SF);
+Serial.print("Bandwidth: "); Serial.println(LORA_BW);
+Serial.print("Coding Rate (denom): "); Serial.println(LORA_CR4);
+
+}
+
+
+
+void loadConfiguration() {
+  preferences.begin("water-meter", false);
+  meterConfig.totalVolume = preferences.getFloat("totalVolume", 0);
+  meterConfig.balance = preferences.getFloat("balance", 0);
+  meterConfig.operationMode = preferences.getString("mode", "prepaid");
+  meterConfig.valveState = (ValveState)preferences.getUInt("valveState", CLOSED);
+  meterConfig.manualControl = preferences.getBool("manualControl", false);
+  
+  String savedSerial = preferences.getString("serial", "");
+  if (savedSerial.length() > 0) {
+    savedSerial.toCharArray(meterConfig.serial, sizeof(meterConfig.serial));
+  } else {
+    String deviceID = getDeviceID();
+    deviceID.toCharArray(meterConfig.serial, sizeof(meterConfig.serial));
+    preferences.putString("serial", meterConfig.serial);
+  }
+  
+  preferences.end();
+
+  // Initialize valve state
+  if (meterConfig.valveState == OPEN) {
+    digitalWrite(VALVE_IN1_PIN, HIGH);
+    digitalWrite(VALVE_IN2_PIN, LOW);
+    Serial.println("🔓 Initial valve state: OPEN");
+  } else {
+    digitalWrite(VALVE_IN1_PIN, LOW);
+    digitalWrite(VALVE_IN2_PIN, HIGH);
+    Serial.println("🔒 Initial valve state: CLOSED");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== Water Meter Control System (LoRa Version) ===");
+  Serial.println("Initializing system...");
+  
+  // Initialize Watchdog
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+  Serial.println("✅ Watchdog initialized");
+  
+  initializeHardware();
+  loadConfiguration();
+  initializeLoRa();
+  
+  Serial.println("\n=== System Initialization Complete ===");
+  printSystemStatus();
+}
+
+void loop() {
+  unsigned long now = millis();
+  esp_task_wdt_reset();
+  
+  // 1. Handle LoRa connectivity
+  if (now - systemState.lastLoraAttempt > LORA_RETRY_INTERVAL) {
+    if (!LoRa.begin(BAND)) {
+      Serial.println("⚠ LoRa connection lost, attempting to reconnect...");
+      initializeLoRa();
+    }
+    systemState.lastLoraAttempt = now;
+  }
+  
+  // 2. Calculate and process flow data
+  if (now - systemState.lastLoopTime > FLOW_CALC_INTERVAL) {
+    calculateFlowRate();
+    systemState.lastLoopTime = now;
+  }
+  
+  // 3. Handle LoRa communication
+  static unsigned long lastSendTime = 0;
+  if (now - lastSendTime > LORA_SEND_INTERVAL) {
+    if (sendLoRaData()) {
+      systemState.sessionVolume = 0; // Reset on successful send
+    }
+    lastSendTime = now;
+  }
+  
+  // 4. Manage valve state
+  manageValve();
+  
+  // 5. Check for manual override timeout
+  if (meterConfig.manualControl && 
+      now - systemState.manualCommandTime > MANUAL_OVERRIDE_TIMEOUT) {
+    meterConfig.manualControl = false;
+    preferences.begin("water-meter", false);
+    preferences.putBool("manualControl", false);
+    preferences.end();
+    Serial.println("🔄 Manual control timeout - Returning to AUTO mode");
+  }
+  
+  // 6. Check for incoming LoRa commands
+  static unsigned long lastCommandTime = 0;
+  if (now - lastCommandTime > COMMAND_CHECK_INTERVAL) {
+    receiveLoRaCommand();
+    lastCommandTime = now;
+  }
+  
+  // 7. Periodic system maintenance
+  performSystemMaintenance();
+}
+
+// =============================================
+// Flow Measurement Functions
+// =============================================
+
+void calculateFlowRate() {
+  noInterrupts();
+  unsigned long pulses = systemState.pulseCount;
+  systemState.pulseCount = 0;
+  interrupts();
+
+  systemState.flowRate = pulses / FLOW_CALIBRATION;
+  float liters = systemState.flowRate / 60.0;
+  
+  systemState.sessionVolume += liters;
+  meterConfig.totalVolume += liters;
+  
+  // Deduct balance if in prepaid mode and valve is open
+  if (meterConfig.operationMode == "prepaid" && 
+      meterConfig.valveState == OPEN && 
+      !meterConfig.manualControl) {
+    float deducted = liters * PRICE_PER_LITER;
+    meterConfig.balance -= deducted;
+    
+    if (meterConfig.balance <= 0) {
+      meterConfig.balance = 0;
+      closeValve();
+      Serial.println("⚠ Balance depleted. Closing valve...");
+    }
+  }
+  
+  Serial.printf("Pulses: %lu | Flow: %.2f L/min | Volume: %.3f L | Balance: %.2f\n", 
+               pulses, systemState.flowRate, liters, meterConfig.balance);
+}
+
+// =============================================
+// Valve Control Functions
+// =============================================
+
+// =============================================
+// Valve Control Functions (Improved)
+// =============================================
+
+void saveValveState() {
+  preferences.begin("water-meter", false);
+  preferences.putUInt("valveState", meterConfig.valveState);
+  preferences.end();
+}
+
+void manageValve() {
+  static unsigned long valveOperationStart = 0;
+  static bool valveOperating = false;
+  
+  // Check if we need to start a new operation
+  if ((meterConfig.valveState == OPENING || meterConfig.valveState == CLOSING) && !valveOperating) {
+    valveOperating = true;
+    valveOperationStart = millis();
+    Serial.printf("Starting valve %s operation\n", 
+                 meterConfig.valveState == OPENING ? "opening" : "closing");
+  }
+  
+  if (valveOperating) {
+    if (millis() - valveOperationStart >= VALVE_OPERATION_TIME * 2) {
+      digitalWrite(VALVE_ENABLE_PIN, LOW);
+      valveOperating = false;
+      meterConfig.valveState = ERROR_TIMEOUT;
+      Serial.println("‼ Valve operation timeout!");
+      saveValveState();
+    } 
+    else if (millis() - valveOperationStart >= VALVE_OPERATION_TIME) {
+      digitalWrite(VALVE_ENABLE_PIN, LOW);
+      valveOperating = false;
+      
+      if (meterConfig.valveState == OPENING) {
+        meterConfig.valveState = OPEN;
+        Serial.println("✅ Valve fully OPEN");
+      } else if (meterConfig.valveState == CLOSING) {
+        meterConfig.valveState = CLOSED;
+        Serial.println("✅ Valve fully CLOSED");
+      }
+      saveValveState();
+    }
+  }
+}
+
+void openValve() {
+  // Check if we're already opening or open
+  if (meterConfig.valveState == OPEN || meterConfig.valveState == OPENING) {
+    return;
+  }
+  
+  // Check debounce interval
+  if (millis() - systemState.lastValveAction < VALVE_DEBOUNCE_INTERVAL) {
+    Serial.println("⚠ Valve operation debounced - too frequent");
+    return;
+  }
+
+  Serial.println("🔓 Opening valve...");
+  meterConfig.valveState = OPENING;
+  digitalWrite(VALVE_IN1_PIN, HIGH);
+  digitalWrite(VALVE_IN2_PIN, LOW);
+  digitalWrite(VALVE_ENABLE_PIN, HIGH);
+  systemState.lastValveAction = millis();
+}
+
+void closeValve() {
+  // Check if we're already closing or closed
+  if (meterConfig.valveState == CLOSED || meterConfig.valveState == CLOSING) {
+    return;
+  }
+  
+  // Check debounce interval
+  if (millis() - systemState.lastValveAction < VALVE_DEBOUNCE_INTERVAL) {
+    Serial.println("⚠ Valve operation debounced - too frequent");
+    return;
+  }
+
+  Serial.println("🔒 Closing valve...");
+  meterConfig.valveState = CLOSING;
+  digitalWrite(VALVE_IN1_PIN, LOW);
+  digitalWrite(VALVE_IN2_PIN, HIGH);
+  digitalWrite(VALVE_ENABLE_PIN, HIGH);
+  systemState.lastValveAction = millis();
+}
+
+// =============================================
+// LoRa Communication Functions
+// =============================================
+
+bool sendLoRaData() {
+  // Create comprehensive JSON payload matching WiFi version
+  DynamicJsonDocument doc(512);
+  doc["flow"] = systemState.flowRate;
+  doc["volume"] = systemState.sessionVolume;
+  doc["total_volume"] = meterConfig.totalVolume;
+  doc["mode"] = meterConfig.operationMode;
+  doc["valve_status"] = valveStateToString(meterConfig.valveState);
+  doc["balance"] = meterConfig.balance;
+  doc["meter_serial"] = meterConfig.serial;
+  doc["manual_control"] = meterConfig.manualControl;
+  doc["device_type"] = "lora_slave";
+
+  String message;
+  serializeJson(doc, message);
+  
+  // Send with retry logic
+  for (int attempt = 0; attempt < 2; attempt++) {
+    LoRa.beginPacket();
+    LoRa.print(message);
+    if (LoRa.endPacket()) {
+      Serial.println("📤 LoRa data sent: " + message);
+      return true;
+    }
+    
+    if (attempt < 1) {
+      Serial.printf("⚠ LoRa send failed (attempt %d), retrying...\n", attempt + 1);
+      delay(2000);
+    }
+  }
+  
+  Serial.println("❌ Failed to send LoRa data after retries");
+  return false;
+}
+
+void receiveLoRaCommand() {
+  LoRa.receive();
+  // Add receive timeout and continuous monitoring
+  unsigned long start = millis();
+  while (millis() - start < 1000) { // Listen for 1 second
+    int packetSize = LoRa.parsePacket();
+    if (packetSize) {
+      String packet = "";
+      while (LoRa.available()) {
+        packet += (char)LoRa.read();
+      }
+      Serial.print("📥 RSSI:");
+      Serial.print(LoRa.packetRssi());
+      Serial.print("dBm SNR:");
+      Serial.print(LoRa.packetSnr());
+      Serial.println(" Received: " + packet);
+      processLoRaCommand(packet);
+      return; // Process one command at a time
+    }
+    delay(1); // Small delay between checks
+  }
+}
+
+
+void processLoRaCommand(String packet) {
+  // Debug first
+  Serial.println("Raw LoRa command received: " + packet);
+  
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, packet);
+  
+  if (error) {
+    Serial.println("JSON parse error: " + String(error.c_str()));
+    return;
+  }
+
+  // Device targeting check
+  const char* target = doc["target"] | "";
+  if (strlen(target) > 0 && 
+      strcmp(target, meterConfig.serial) != 0 && 
+      strcmp(target, "broadcast") != 0) {
+    Serial.println("Command not for this device");
+    return;
+  }
+
+    if (doc.containsKey("balance")) {
+    float newBalance = doc["balance"].as<float>();
+    if (newBalance != meterConfig.balance) {  // Only update if balance changed
+      meterConfig.balance = newBalance;
+      preferences.begin("water-meter", false);
+      preferences.putFloat("balance", meterConfig.balance);
+      preferences.end();
+      Serial.printf("Balance updated to: %.2f\n", meterConfig.balance);
+      
+      // Force automatic control check after balance update
+      if (!meterConfig.manualControl) {
+        handleAutomaticValveControl(meterConfig.balance);
+      }
+    }
+  }
+
+  // Valve command processing
+  if (doc.containsKey("valve_command")) {
+    String vCmd = doc["valve_command"].as<String>();
+    vCmd.trim();
+    vCmd.toLowerCase();
+
+    if (vCmd.startsWith("open") || vCmd == "1") {
+      meterConfig.manualControl = true;
+      systemState.manualCommandTime = millis();
+      openValve();
+      Serial.println("Executed OPEN valve command");
+    } 
+    else if (vCmd.startsWith("close") || vCmd == "0") {
+      meterConfig.manualControl = true;
+      systemState.manualCommandTime = millis();
+      closeValve();
+      Serial.println("Executed CLOSE valve command");
+    }
+  }
+
+  // Mode change
+  if (doc.containsKey("mode")) {
+    String newMode = doc["mode"].as<String>();
+    newMode.trim();
+    if (newMode.length() > 0) {
+      changeOperationMode(newMode.c_str());
+    }
+  }
+
+  // Automatic control if not manual
+  if (!meterConfig.manualControl) {
+    handleAutomaticValveControl(meterConfig.balance);
+  }
+}
+// =============================================
+// System Management Functions
+// =============================================
+
+String valveStateToString(ValveState state) {
+  switch (state) {
+    case OPEN: return "open";
+    case OPENING: return "opening";
+    case CLOSED: return "closed";
+    case CLOSING: return "closing";
+    case ERROR_STUCK: return "error_stuck";
+    case ERROR_TIMEOUT: return "error_timeout";
+    default: return "unknown";
+  }
+}
+
+void changeOperationMode(const char* mode) {
+  meterConfig.operationMode = mode;
+  preferences.begin("water-meter", false);
+  preferences.putString("mode", meterConfig.operationMode);
+  preferences.end();
+  
+  Serial.printf("🔄 Mode changed to %s\n", mode);
+
+  // In postpaid mode, open valve if closed
+  if (strcmp(mode, "postpaid") == 0 && 
+      (meterConfig.valveState == CLOSED || meterConfig.valveState == CLOSING)) {
+    openValve();
+  }
+}
+
+
+
+void handleAutomaticValveControl(float balance) {
+  Serial.printf("Checking automatic valve control. Balance: %.2f, Mode: %s, Valve State: %s\n",
+               balance, 
+               meterConfig.operationMode.c_str(),
+               valveStateToString(meterConfig.valveState));
+
+  if (meterConfig.operationMode == "prepaid") {
+    if (balance > MIN_BALANCE_THRESHOLD) {
+      if (meterConfig.valveState == CLOSED || meterConfig.valveState == CLOSING) {
+        Serial.printf("💰 Sufficient balance (%.2f), opening valve\n", balance);
+        openValve();
+      } else {
+        Serial.println("Valve already open or opening");
+      }
+    } else {
+      if (meterConfig.valveState == OPEN || meterConfig.valveState == OPENING) {
+        Serial.printf("⚠ Low balance (%.2f), closing valve\n", balance);
+        closeValve();
+      } else {
+        Serial.println("Valve already closed or closing");
+      }
+    }
+  } else { // Postpaid mode
+    if (meterConfig.valveState == CLOSED || meterConfig.valveState == CLOSING) {
+      Serial.println("📝 Postpaid mode, opening valve");
+      openValve();
+    }
+  }
+}
+
+void performSystemMaintenance() {
+  static unsigned long lastSaveTime = 0;
+  if (millis() - lastSaveTime > SAVE_INTERVAL) {
+    preferences.begin("water-meter", false);
+    preferences.putFloat("totalVolume", meterConfig.totalVolume);
+    preferences.putString("mode", meterConfig.operationMode);
+    preferences.putUInt("valveState", meterConfig.valveState);
+    preferences.putBool("manualControl", meterConfig.manualControl);
+    preferences.end();
+    
+    lastSaveTime = millis();
+    Serial.println("💾 System state saved to flash");
+  }
+}
+
+void printSystemStatus() {
+  Serial.println("\n=== SYSTEM STATUS ===");
+  Serial.printf("Device ID: %s\n", meterConfig.serial);
+  Serial.printf("Operation Mode: %s\n", meterConfig.operationMode.c_str());
+  Serial.printf("Valve State: %s\n", valveStateToString(meterConfig.valveState));
+  Serial.printf("Manual Control: %s\n", meterConfig.manualControl ? "YES" : "NO");
+  Serial.printf("Total Volume: %.3f L\n", meterConfig.totalVolume);
+  Serial.printf("Current Flow: %.2f L/min\n", systemState.flowRate);
+  Serial.printf("Balance: %.2f\n", meterConfig.balance);
+  Serial.println("====================\n");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+atleasw working master 
+
+/*
+  LoRa Gateway (ESP32) - Multi-slave, persistent mapping, status web UI
+  - Forwards LoRa JSON to https://smart-meter-server.onrender.com/log_data.php (POST JSON)
+  - If log returns 404 and packet has device_id -> POST device_id to /get_serial.php -> store mapping
+  - After successful log -> GET /get_command?meter_serial=<serial>, enqueue commands and send via LoRa
+  - Stores device_id->meter_serial mappings and last_seen/last_reading in Preferences (flash)
+  - Provides local status UI: http://<gateway-ip>/  and JSON at /status.json
+*/
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include <Preferences.h>
+#include <WebServer.h>
+
+// ========== CONFIG ==========
+#define LORA_BAND 923E6
+#define LORA_SS   18
+#define LORA_RST  14
+#define LORA_DIO0 26
+
+const char* ssid = "GalaxyA23B729";
+const char* password = "Chris1234";
+const char* apiBaseUrl = "https://smart-meter-server.onrender.com"; // no trailing slash
+
+// ========== QUEUE ITEM ==========
+struct PendingCommand {
+  char meterSerial[32];
+  char commandType[16];   // "valve_command" or "mode"
+  char commandValue[64];
+  unsigned long receivedTime;
+};
+
+QueueHandle_t commandQueue;
+Preferences prefs;
+WebServer webServer(80);
+
+unsigned long lastCommandCheck = 0;
+const long commandCheckInterval = 10000; // 10s
+String lastReceivedMeterSerial = "";
+
+// In-memory cache stored as ArduinoJson object; persists to prefs as a JSON string
+// Structure:
+// {
+//   "mappings": { "device_id": "meter_serial", ... },
+//   "meta": {
+//      "meter_serial": { "last_seen": 123456789, "last_reading": { ... } },
+//      ...
+//   }
+// }
+StaticJsonDocument<8192> storeDoc; // adjust size if many slaves; this holds mappings+meta
+
+// ========== Helpers ==========
+static void safeStrCopy(char* dest, const String& src, size_t maxlen) {
+  size_t toCopy = min((size_t)src.length(), maxlen - 1);
+  src.toCharArray(dest, toCopy + 1);
+  dest[toCopy] = '\0';
+}
+
+String urlEncode(const String &str) {
+  String ret;
+  char buf[4];
+  for (size_t i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if ( ('a' <= c && c <= 'z') ||
+         ('A' <= c && c <= 'Z') ||
+         ('0' <= c && c <= '9') ||
+         c == '-' || c == '_' || c == '.' || c == '~' ) {
+      ret += c;
+    } else {
+      sprintf(buf, "%%%02X", (uint8_t)c);
+      ret += buf;
+    }
+  }
+  return ret;
+}
+
+String isoTimestamp(unsigned long epochMillis) {
+  // return simple human-friendly elapsed/time. We'll produce millis->local time string approximate.
+  // For simplicity we show epochMillis as millis() difference from gateway boot (can't get RTC). We'll show relative secs.
+  unsigned long now = millis();
+  long diff = (long)((now > epochMillis) ? (now - epochMillis) : 0);
+  if (diff < 1000) return "just now";
+  if (diff < 60000) return String(diff / 1000) + "s ago";
+  if (diff < 3600000) return String(diff / 60000) + "m ago";
+  if (diff < 86400000) return String(diff / 3600000) + "h ago";
+  return String(diff / 86400000) + "d ago";
+}
+
+// Persist storeDoc to Preferences under key "store_json"
+void saveStoreToPrefs() {
+  String out;
+  serializeJson(storeDoc, out);
+  prefs.begin("gateway_store", false);
+  prefs.putString("store_json", out);
+  prefs.end();
+  Serial.println("Store persisted to flash (size " + String(out.length()) + ")");
+}
+
+// Load storeDoc from Preferences (if present), else initialize empty shape
+void loadStoreFromPrefs() {
+  prefs.begin("gateway_store", true);
+  String s = prefs.getString("store_json", "");
+  prefs.end();
+  if (s.length() > 0) {
+    DeserializationError err = deserializeJson(storeDoc, s);
+    if (err) {
+      Serial.println("Failed to parse stored JSON, resetting store.");
+      storeDoc.clear();
+    } else {
+      Serial.println("Loaded store from prefs.");
+    }
+  } else {
+    // Initialize structure
+    storeDoc.to<JsonObject>(); // ensure doc exists
+    storeDoc["mappings"] = JsonObject();
+    storeDoc["meta"] = JsonObject();
+    Serial.println("Initialized empty store.");
+  }
+}
+
+// Helper: set mapping device_id -> meter_serial and persist
+void setMappingAndPersist(const String& deviceId, const String& meterSerial) {
+  if (deviceId.length() == 0 || meterSerial.length() == 0) return;
+  JsonObject mappings = storeDoc["mappings"].as<JsonObject>();
+  mappings[deviceId] = meterSerial;
+  saveStoreToPrefs();
+  Serial.println("Mapping saved: " + deviceId + " -> " + meterSerial);
+}
+
+// Helper: update meta for meterSerial (last_seen, last_reading)
+void updateMetaForSerial(const String& meterSerial, const DynamicJsonDocument& reading) {
+  if (meterSerial.length() == 0) return;
+  JsonObject meta = storeDoc["meta"].as<JsonObject>();
+  JsonObject entry = meta[meterSerial].as<JsonObject>();
+  if (entry.isNull()) {
+    entry = meta.createNestedObject(meterSerial);
+  }
+  entry["last_seen_ms"] = millis();
+  // copy reading object into entry["last_reading"]
+  entry.remove("last_reading");
+  entry.createNestedObject("last_reading");
+  serializeJson(reading, Serial); // debug
+  // We'll copy using a temporary string to avoid deep copying issues
+  String tmp;
+  serializeJson(reading, tmp);
+  DynamicJsonDocument tmpDoc(1024);
+  deserializeJson(tmpDoc, tmp);
+  entry["last_reading"] = tmpDoc.as<JsonVariant>();
+  saveStoreToPrefs();
+}
+
+// ========== WiFi & LoRa ==========
+void connectToWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\nFailed to connect to WiFi (check credentials / signal)");
+  }
+}
+
+void setupLoRa() {
+  SPI.begin(5, 19, 27, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(LORA_BAND)) {
+    Serial.println("LoRa init failed!");
+    while (1) delay(1000);
+  }
+  LoRa.setTxPower(20);
+  LoRa.setSpreadingFactor(9);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.enableCrc();
+  LoRa.setSyncWord(0xF3); // Must match slave!
+  Serial.println("LoRa Ready");
+}
+
+// ========== Server interactions ==========
+String callGetSerialForDevice(const String& deviceId) {
+  if (deviceId.length() == 0) return "";
+
+  // check in-memory mapping first
+  if (storeDoc.containsKey("mappings")) {
+    JsonObject mappings = storeDoc["mappings"].as<JsonObject>();
+    if (mappings.containsKey(deviceId)) {
+      String cached = String(mappings[deviceId].as<const char*>());
+      Serial.println("Cached mapping found: " + deviceId + " -> " + cached);
+      return cached;
+    }
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No WiFi - cannot call get_serial.php");
+    return "";
+  }
+
+  HTTPClient http;
+  String url = String(apiBaseUrl) + "/get_serial.php";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String body = "device_id=" + urlEncode(deviceId);
+  int code = http.POST(body);
+  String resp = http.getString();
+  Serial.printf("POST %s -> %d\n", url.c_str(), code);
+  Serial.println("Body: " + resp);
+
+  if (code == HTTP_CODE_OK) {
+    String serial = resp;
+    serial.trim();
+    if (serial.length() > 0) {
+      // update mapping
+      setMappingAndPersist(deviceId, serial);
+      http.end();
+      return serial;
+    }
+  } else {
+    Serial.println("get_serial.php returned code: " + String(code));
+    Serial.println("Body: " + resp);
+  }
+  http.end();
+  return "";
+}
+
+bool forwardToAPIAndMaybeRegister(const String& originalPacket) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No WiFi - cannot forward data");
+    return false;
+  }
+
+  DynamicJsonDocument inDoc(2048);
+  DeserializationError derr = deserializeJson(inDoc, originalPacket);
+  if (derr) {
+    Serial.println("Received non-JSON LoRa payload. Skipping forward.");
+    return false;
+  }
+
+  // Build payload expected by log_data.php
+  DynamicJsonDocument outDoc(1024);
+  if (inDoc.containsKey("flow")) outDoc["flow"] = (double)inDoc["flow"];
+  if (inDoc.containsKey("volume")) outDoc["volume"] = (double)inDoc["volume"];
+  if (inDoc.containsKey("total_volume")) outDoc["total_volume"] = (double)inDoc["total_volume"];
+  if (inDoc.containsKey("valve_status")) outDoc["valve_status"] = String(inDoc["valve_status"].as<const char*>());
+  if (inDoc.containsKey("balance")) outDoc["balance"] = (double)inDoc["balance"];
+
+  String meterSerial = "";
+  if (inDoc.containsKey("meter_serial")) meterSerial = String(inDoc["meter_serial"].as<const char*>());
+
+  // If no meter_serial, try get mapping via device_id
+  if (meterSerial.length() == 0 && inDoc.containsKey("device_id")) {
+    String dev = inDoc["device_id"].as<const char*>();
+    meterSerial = callGetSerialForDevice(dev);
+  }
+
+  if (meterSerial.length() > 0) outDoc["meter_serial"] = meterSerial;
+
+  // store last_reading / last_seen for the meter (if we have meterSerial)
+  if (meterSerial.length() > 0) {
+    // create temp doc for last reading copy
+    DynamicJsonDocument tmpReading(1024);
+    tmpReading = inDoc; // copy
+    updateMetaForSerial(meterSerial, tmpReading);
+  }
+
+  // Validate required fields
+  if (!outDoc.containsKey("flow") || !outDoc.containsKey("volume") ||
+      !outDoc.containsKey("total_volume") || !outDoc.containsKey("valve_status") ||
+      !outDoc.containsKey("meter_serial")) {
+    Serial.println("Missing required fields for log_data.php; not sending.");
+    return false;
+  }
+
+  // POST JSON
+  HTTPClient http;
+  String url = String(apiBaseUrl) + "/log_data.php";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  String outPayload;
+  serializeJson(outDoc, outPayload);
+  int code = http.POST(outPayload);
+  String resp = http.getString();
+  Serial.printf("POST %s -> %d\n", url.c_str(), code);
+  Serial.println("Response: " + resp);
+
+  if (code == HTTP_CODE_OK) {
+    // Successful logging -> immediately check commands
+    String serialToQuery = outDoc["meter_serial"].as<const char*>();
+    if (serialToQuery.length() > 0) checkForCommandForSerial(serialToQuery);
+    http.end();
+    return true;
+  } else if (code == HTTP_CODE_NOT_FOUND) {
+    // meter not found; try auto-registration if device_id present
+    Serial.println("log_data.php: meter not found (404)");
+    if (inDoc.containsKey("device_id")) {
+      String dev = inDoc["device_id"].as<const char*>();
+      String newSerial = callGetSerialForDevice(dev);
+      if (newSerial.length() > 0) {
+        outDoc["meter_serial"] = newSerial;
+        String retryPayload;
+        serializeJson(outDoc, retryPayload);
+        HTTPClient http2;
+        http2.begin(String(apiBaseUrl) + "/log_data.php");
+        http2.addHeader("Content-Type", "application/json");
+        int retryCode = http2.POST(retryPayload);
+        String retryResp = http2.getString();
+        Serial.printf("Retry POST -> %d\n", retryCode);
+        Serial.println("Response: " + retryResp);
+        if (retryCode == HTTP_CODE_OK) {
+          checkForCommandForSerial(newSerial);
+          http2.end();
+          http.end();
+          return true;
+        }
+        http2.end();
+      } else {
+        Serial.println("Auto-registration failed or no meters available.");
+      }
+    } else {
+      Serial.println("No device_id to attempt auto-registration.");
+    }
+  } else {
+    Serial.println("log_data.php returned code: " + String(code));
+  }
+  http.end();
+  return false;
+}
+
+void checkForCommandForSerial(const String& meterSerial) {
+  if (meterSerial.length() == 0) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("No WiFi - cannot check commands");
+    return;
+  }
+
+  HTTPClient http;
+  String url = String(apiBaseUrl) + "/get_command.php?meter_serial=" + urlEncode(meterSerial);
+  http.begin(url);
+  int code = http.GET();
+  String body = http.getString();
+  Serial.printf("GET %s -> %d\n", url.c_str(), code);
+  Serial.println("Body: " + body);
+
+  if (code == HTTP_CODE_OK) {
+    DynamicJsonDocument doc(512);
+    DeserializationError derr = deserializeJson(doc, body);
+    if (derr) {
+      Serial.println("Failed to parse get_command JSON");
+      http.end();
+      return;
+    }
+    String status = doc["status"] | "";
+    if (status != "success") {
+      Serial.println("get_command status != success");
+      http.end();
+      return;
+    }
+
+    String valveCmd = doc["valve_command"] | "";
+    String modeCmd  = doc["mode"] | "";
+
+    if (valveCmd.length() > 0) {
+      PendingCommand q; memset(&q,0,sizeof(q));
+      safeStrCopy(q.meterSerial, meterSerial, sizeof(q.meterSerial));
+      safeStrCopy(q.commandType, "valve_command", sizeof(q.commandType));
+      safeStrCopy(q.commandValue, valveCmd, sizeof(q.commandValue));
+      q.receivedTime = millis();
+      if (xQueueSend(commandQueue, &q, 0) != pdTRUE) Serial.println("Command queue full — valve_command dropped");
+      else Serial.println("Queued valve_command: " + valveCmd);
+    }
+    if (modeCmd.length() > 0) {
+      PendingCommand q; memset(&q,0,sizeof(q));
+      safeStrCopy(q.meterSerial, meterSerial, sizeof(q.meterSerial));
+      safeStrCopy(q.commandType, "mode", sizeof(q.commandType));
+      safeStrCopy(q.commandValue, modeCmd, sizeof(q.commandValue));
+      q.receivedTime = millis();
+      if (xQueueSend(commandQueue, &q, 0) != pdTRUE) Serial.println("Command queue full — mode dropped");
+      else Serial.println("Queued mode command: " + modeCmd);
+    }
+  } else {
+    Serial.println("get_command returned HTTP code: " + String(code));
+    Serial.println("Body: " + body);
+  }
+  http.end();
+}
+
+void sendLoRaCommandFromStruct(const PendingCommand& cmd) {
+  DynamicJsonDocument doc(512); // Increased size
+  
+  // Get fresh command from server (don't just use queued command)
+  HTTPClient http;
+  String url = String(apiBaseUrl) + "/get_command.php?meter_serial=" + urlEncode(String(cmd.meterSerial));
+  http.begin(url);
+  int code = http.GET();
+  
+  if (code == HTTP_CODE_OK) {
+    String body = http.getString();
+    deserializeJson(doc, body); // Use server's full response
+    
+    // Add target field for LoRa addressing
+    doc["target"] = String(cmd.meterSerial);
+    
+    String output;
+    serializeJson(doc, output);
+    LoRa.beginPacket();
+    LoRa.print(output);
+    LoRa.endPacket();
+    Serial.println("Sent full LoRa command: " + output);
+  } else {
+    Serial.println("Failed to refresh command from server");
+  }
+  http.end();
+}
+
+// ========== Web UI ==========
+String buildStatusHtml() {
+  String html = "<!doctype html><html><head><meta charset='utf-8'><title>Gateway Status</title>"
+                "<style>body{font-family:Arial;padding:12px}table{border-collapse:collapse;width:100%}"
+                "th,td{border:1px solid #ccc;padding:6px;text-align:left}th{background:#eee}</style></head><body>";
+  html += "<h2>LoRa Gateway Status</h2>";
+  html += "<p>IP: " + WiFi.localIP().toString() + " &nbsp; Queue size: " + String(uxQueueMessagesWaiting(commandQueue)) + "</p>";
+
+  html += "<h3>Mappings (device_id -> meter_serial)</h3>";
+  html += "<table><tr><th>Device ID</th><th>Meter Serial</th><th>Last Seen</th><th>Last Reading</th></tr>";
+  if (storeDoc.containsKey("mappings")) {
+    JsonObject mappings = storeDoc["mappings"].as<JsonObject>();
+    JsonObject meta = storeDoc["meta"].as<JsonObject>();
+    for (JsonPair kv : mappings) {
+      String dev = String(kv.key().c_str());
+      String serial = String(kv.value().as<const char*>());
+      html += "<tr><td>" + dev + "</td><td>" + serial + "</td>";
+      if (meta.containsKey(serial)) {
+        JsonObject ent = meta[serial].as<JsonObject>();
+        unsigned long lastSeen = ent["last_seen_ms"] | 0;
+        String lastSeenStr = isoTimestamp(lastSeen);
+        html += "<td>" + lastSeenStr + "</td>";
+        // last_reading
+        String readingStr;
+        if (ent.containsKey("last_reading")) {
+          String tmp; serializeJson(ent["last_reading"], tmp);
+          readingStr = tmp;
+        } else readingStr = "";
+        html += "<td><pre style='white-space:pre-wrap;max-width:600px;'>" + readingStr + "</pre></td>";
+      } else {
+        html += "<td>-</td><td>-</td>";
+      }
+      html += "</tr>";
+    }
+  }
+  html += "</table>";
+
+  html += "<p>Refesh to update. /status.json gives machine-readable output.</p>";
+  html += "</body></html>";
+  return html;
+}
+
+void handleRoot() {
+  webServer.send(200, "text/html", buildStatusHtml());
+}
+
+void handleStatusJson() {
+  String out;
+  serializeJson(storeDoc, out);
+  // also add some runtime info
+  DynamicJsonDocument wrapper(4096);
+  wrapper["ip"] = WiFi.localIP().toString();
+  wrapper["queue_size"] = uxQueueMessagesWaiting(commandQueue);
+  wrapper["store"] = storeDoc;
+  String result;
+  serializeJson(wrapper, result);
+  webServer.send(200, "application/json", result);
+}
+
+// ========== Setup/Loop ==========
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== LoRa Gateway (multi-slave, status UI) ===");
+
+  // create queue for commands
+  commandQueue = xQueueCreate(20, sizeof(PendingCommand));
+  if (commandQueue == NULL) {
+    Serial.println("Failed to create command queue - aborting");
+    while (1) delay(1000);
+  }
+
+  prefs.begin("gateway_store", false);
+  loadStoreFromPrefs();
+
+  connectToWiFi();
+  setupLoRa();
+
+  // web server
+  webServer.on("/", handleRoot);
+  webServer.on("/status.json", handleStatusJson);
+  webServer.begin();
+  Serial.println("Web server started at / and /status.json");
+}
+
+void loop() {
+  // web server handling
+  webServer.handleClient();
+
+  // Receive LoRa packets
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String packet = "";
+    while (LoRa.available()) packet += (char)LoRa.read();
+    Serial.println("Received LoRa payload: " + packet);
+
+    // parse packet to JSON
+    DynamicJsonDocument tmpDoc(2048);
+    if (deserializeJson(tmpDoc, packet) == DeserializationError::Ok) {
+      // update mapping if packet contains device_id and meter_serial (or use callGetSerialForDevice)
+      String deviceId = tmpDoc.containsKey("device_id") ? String(tmpDoc["device_id"].as<const char*>()) : "";
+      String meterSerial = tmpDoc.containsKey("meter_serial") ? String(tmpDoc["meter_serial"].as<const char*>()) : "";
+
+      if (deviceId.length() > 0 && meterSerial.length() > 0) {
+        setMappingAndPersist(deviceId, meterSerial);
+      } else if (deviceId.length() > 0 && meterSerial.length() == 0) {
+        // try to get mapping from server (if not present in mappings)
+        String mapped = callGetSerialForDevice(deviceId);
+        if (mapped.length() > 0) meterSerial = mapped;
+      }
+
+      if (meterSerial.length() > 0) lastReceivedMeterSerial = meterSerial;
+
+      // update meta (last_seen + last_reading)
+      updateMetaForSerial(meterSerial, tmpDoc);
+    }
+
+    // forward to server (and auto-register if necessary)
+    forwardToAPIAndMaybeRegister(packet);
+  }
+
+  // Periodic check for commands for lastReceivedMeterSerial
+  if (millis() - lastCommandCheck > commandCheckInterval) {
+    if (lastReceivedMeterSerial.length() > 0) {
+      checkForCommandForSerial(lastReceivedMeterSerial);
+    }
+    lastCommandCheck = millis();
+  }
+
+  // Process queued commands
+  if (uxQueueMessagesWaiting(commandQueue) > 0) {
+    PendingCommand cmd;
+    if (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+      sendLoRaCommandFromStruct(cmd);
+    }
+  }
+
+  // Keep WiFi alive
+  if (WiFi.status() != WL_CONNECTED) connectToWiFi();
+
+  delay(50);
+}

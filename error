@@ -1,0 +1,292 @@
+   if (currentTime % 30000 == 0) { // Every 30 seconds
+
+Arduino: 1.8.19 (Windows Store 1.8.57.0) (Windows 10), Board: "ESP32 Dev Module, Disabled, Disabled, Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS), 240MHz (WiFi/BT), QIO, 80MHz, 4MB (32Mb), 115200, Core 1, Core 1, None, Enabled, Disabled"
+
+C:\Users\HP\Documents\Arduino\trial_leb_mac_address\smart_water_meter\smart_water_meter.ino: In function 'void calculateFlowRate()':
+
+smart_water_meter:141:7: error: 'currentTime' was not declared in this scope
+
+
+
+
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+
+// Configuration
+#define FLOW_SENSOR_PIN 27       // YF-S201 sensor output
+#define VALVE_ENABLE_PIN 26      // H-bridge enable
+#define VALVE_IN1_PIN 25         // H-bridge control 1
+#define VALVE_IN2_PIN 33         // H-bridge control 2
+#define FLOW_CALIBRATION 7.5     // Pulses per liter
+#define PRICE_PER_LITER 1.0      // 1 KES per liter
+
+// WiFi credentials (consider using WiFiManager for configuration)
+const char* ssid = "GalaxyA23B729";
+const char* password = "Chris1234";
+
+// Server settings
+const char* serverIP = "192.168.42.121";
+const char* commandEndpoint = "/smart/get_command.php";
+const char* logEndpoint = "/smart/log_data.php";
+
+// System variables
+volatile int pulseCount = 0;
+float flowRate = 0.0;            // L/min
+float totalVolume = 0.0;         // Lifetime total (L)
+float sessionVolume = 0.0;       // Current session (L)
+float balance = 0.0;             // KES
+String operationMode = "prepaid"; // prepaid/postpaid
+String valveStatus = "closed";   // closed/opening/open/closing
+unsigned long lastSendTime = 0;
+unsigned long lastCommandTime = 0;
+unsigned long lastFlowCalcTime = 0;
+Preferences preferences;
+
+void IRAM_ATTR pulseCounter() {
+  pulseCount++;
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize hardware
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(VALVE_ENABLE_PIN, OUTPUT);
+  pinMode(VALVE_IN1_PIN, OUTPUT);
+  pinMode(VALVE_IN2_PIN, OUTPUT);
+  digitalWrite(VALVE_ENABLE_PIN, LOW); // Disable H-bridge initially
+  
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), pulseCounter, RISING);
+
+  // Load persistent data
+  preferences.begin("water-meter", false);
+  totalVolume = preferences.getFloat("totalVolume", 0);
+  balance = preferences.getFloat("balance", 0);
+  operationMode = preferences.getString("mode", "prepaid");
+  preferences.end();
+
+  // Connect to WiFi
+  connectToWiFi();
+  
+  Serial.println("\nSystem initialized");
+  Serial.printf("Total Volume: %.2f L\n", totalVolume);
+  Serial.printf("Current Balance: %.2f KES\n", balance);
+  Serial.printf("Operation Mode: %s\n", operationMode.c_str());
+}
+
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    Serial.print(".");
+    delay(500);
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Connected to WiFi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ Failed to connect to WiFi");
+  }
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  // Calculate flow rate every second
+  if (currentTime - lastFlowCalcTime >= 1000) {
+    calculateFlowRate();
+    lastFlowCalcTime = currentTime;
+  }
+
+  // Send data to server every 5 seconds
+  if (currentTime - lastSendTime >= 5000) {
+    if (WiFi.status() != WL_CONNECTED) {
+      connectToWiFi();
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      sendToServer();
+      checkForAdminCommand();
+    }
+    lastSendTime = currentTime;
+  }
+
+  // Valve control logic
+  manageValve();
+}
+
+void calculateFlowRate() {
+  detachInterrupt(FLOW_SENSOR_PIN);
+  
+  // Calculate flow in L/min
+  flowRate = (pulseCount / FLOW_CALIBRATION); 
+  float litersThisSecond = flowRate / 60.0;
+  
+  // Update volumes
+  sessionVolume += litersThisSecond;
+  totalVolume += litersThisSecond;
+  
+  // Update balance (for postpaid mode)
+  if (operationMode == "postpaid") {
+    balance += litersThisSecond * PRICE_PER_LITER;
+  } 
+  // Deduct balance (for prepaid mode)
+  else if (operationMode == "prepaid") {
+    balance -= litersThisSecond * PRICE_PER_LITER;
+    if (balance <= 0) {
+      balance = 0;
+      closeValve();
+    }
+  }
+  
+  pulseCount = 0;
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), pulseCounter, RISING);
+
+  // Save persistent data periodically
+  if (currentTime % 30000 == 0) { // Every 30 seconds
+    preferences.begin("water-meter", false);
+    preferences.putFloat("totalVolume", totalVolume);
+    preferences.putFloat("balance", balance);
+    preferences.putString("mode", operationMode);
+    preferences.end();
+  }
+}
+
+void manageValve() {
+  // In prepaid mode, valve opens only when balance > 0
+  if (operationMode == "prepaid") {
+    if (balance > 0 && valveStatus != "open") {
+      openValve();
+    } else if (balance <= 0 && valveStatus == "open") {
+      closeValve();
+    }
+  }
+  // In postpaid mode, valve is always open (admin can close manually)
+}
+
+void openValve() {
+  if (valveStatus == "open" || valveStatus == "opening") return;
+  
+  Serial.println("Opening valve...");
+  valveStatus = "opening";
+  
+  // Activate H-bridge to open valve
+  digitalWrite(VALVE_IN1_PIN, HIGH);
+  digitalWrite(VALVE_IN2_PIN, LOW);
+  digitalWrite(VALVE_ENABLE_PIN, HIGH);
+  
+  // Simulate valve opening time (adjust based on your valve)
+  delay(2000); 
+  digitalWrite(VALVE_ENABLE_PIN, LOW);
+  
+  valveStatus = "open";
+  Serial.println("Valve opened");
+}
+
+void closeValve() {
+  if (valveStatus == "closed" || valveStatus == "closing") return;
+  
+  Serial.println("Closing valve...");
+  valveStatus = "closing";
+  
+  // Activate H-bridge to close valve
+  digitalWrite(VALVE_IN1_PIN, LOW);
+  digitalWrite(VALVE_IN2_PIN, HIGH);
+  digitalWrite(VALVE_ENABLE_PIN, HIGH);
+  
+  // Simulate valve closing time (adjust based on your valve)
+  delay(2000);
+  digitalWrite(VALVE_ENABLE_PIN, LOW);
+  
+  valveStatus = "closed";
+  Serial.println("Valve closed");
+}
+
+void sendToServer() {
+  HTTPClient http;
+  String url = "http://" + String(serverIP) + String(logEndpoint);
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData = "flow=" + String(flowRate, 2) +
+                   "&volume=" + String(sessionVolume, 2) +
+                   "&total_volume=" + String(totalVolume, 2) +
+                   "&balance=" + String(balance, 2) +
+                   "&mode=" + operationMode +
+                   "&valve_status=" + valveStatus;
+
+  int httpCode = http.POST(postData);
+  
+  if (httpCode == 200) {
+    String response = http.getString();
+    Serial.println("📤 Data sent successfully");
+  } else {
+    Serial.println("❌ Failed to send data → HTTP code: " + String(httpCode));
+  }
+  
+  http.end();
+}
+
+void checkForAdminCommand() {
+  HTTPClient http;
+  String url = "http://" + String(serverIP) + String(commandEndpoint);
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    Serial.println("📥 Command response: " + payload);
+
+    // Parse commands (simplified - consider using ArduinoJson for proper parsing)
+    if (payload.indexOf("\"topup\":") > 0) {
+      float topup = payload.substring(payload.indexOf("\"topup\":") + 8).toFloat();
+      if (topup > 0) {
+        balance += topup;
+        Serial.printf("💸 Top-up received: %.2f KES → New Balance: %.2f KES\n", topup, balance);
+      }
+    }
+
+    if (payload.indexOf("\"valve_command\":\"open\"") > 0) {
+      openValve();
+    } 
+    else if (payload.indexOf("\"valve_command\":\"close\"") > 0) {
+      closeValve();
+    }
+
+    if (payload.indexOf("\"mode\":\"prepaid\"") > 0) {
+      operationMode = "prepaid";
+    }
+    else if (payload.indexOf("\"mode\":\"postpaid\"") > 0) {
+      operationMode = "postpaid";
+    }
+  }
+  
+  http.end();
+}
+
+  141 |   if (currentTime % 30000 == 0) { // Every 30 seconds
+
+      |       ^~~~~~~~~~~
+
+Multiple libraries were found for "WiFi.h"
+
+ Used: C:\Users\HP\Documents\ArduinoData\packages\esp32\hardware\esp32\3.2.0\libraries\WiFi
+
+ Not used: C:\Program Files\WindowsApps\ArduinoLLC.ArduinoIDE_1.8.57.0_x86__mdqgnx93n4wtt\libraries\WiFi
+
+exit status 1
+
+'currentTime' was not declared in this scope
+
+
+
+This report would have more information with
+"Show verbose output during compilation"
+option enabled in File -> Preferences.
