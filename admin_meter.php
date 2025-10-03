@@ -151,14 +151,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
         ]);
 
                 // Update latest balance in flow_data (Quick Fix Option A)
-        $stmt = $pdo->prepare("
-            UPDATE flow_data
-            SET balance = balance + ?
-            WHERE meter_id = ?
-            ORDER BY recorded_at DESC
-            LIMIT 1
-        ");
-        $stmt->execute([$amount, $meter_id]);
+$stmt = $pdo->prepare("
+    UPDATE flow_data
+    SET balance = balance + ?
+    WHERE id = (
+        SELECT id FROM flow_data
+        WHERE meter_id = ?
+        ORDER BY recorded_at DESC
+        LIMIT 1
+    )
+");
+$stmt->execute([$amount, $meter_id]);
+
 
         
         // Mark any existing topup commands as executed
