@@ -149,6 +149,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
             $transaction_code,
             $_SESSION['admin_id']
         ]);
+                // Update latest balance in flow_data (Quick Fix Option A)
+        $stmt = $pdo->prepare("
+            UPDATE flow_data
+            SET balance = balance + ?
+            WHERE meter_id = ?
+            ORDER BY recorded_at DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$amount, $meter_id]);
+
         
         // Mark any existing topup commands as executed
         $stmt = $pdo->prepare("
@@ -298,7 +308,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
                                     <div class="card mb-3">
                                         <div class="card-body">
                                             <h6 class="card-title">Flow Rate</h6>
-                                            <h3 class="mb-0"><?= number_format($flow_data['flow_rate'], 2) ?> L/min</h3>
+                                            <h3 id="flow_rate" class="mb-0"><?= number_format($flow_data['flow_rate'], 2) ?> L/min</h3>
+
                                         </div>
                                     </div>
                                 </div>
@@ -306,7 +317,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
                                     <div class="card mb-3">
                                         <div class="card-body">
                                             <h6 class="card-title">Session Volume</h6>
-                                            <h3 class="mb-0"><?= number_format($flow_data['volume'], 2) ?> L</h3>
+                                            <h3 id="session_volume" class="mb-0"><?= number_format($flow_data['volume'], 2) ?> L</h3>
                                         </div>
                                     </div>
                                 </div>
@@ -314,7 +325,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
                                     <div class="card mb-3">
                                         <div class="card-body">
                                             <h6 class="card-title">Total Volume</h6>
-                                            <h3 class="mb-0"><?= number_format($flow_data['total_volume'], 2) ?> L</h3>
+                                            <h3 id="total_volume" class="mb-0"><?= number_format($flow_data['total_volume'], 2) ?> L</h3>
                                         </div>
                                     </div>
                                 </div>
@@ -322,7 +333,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
                                     <div class="card mb-3 <?= $flow_data['balance'] < 100 ? 'bg-warning text-white' : '' ?>">
                                         <div class="card-body">
                                             <h6 class="card-title">Balance</h6>
-                                            <h3 class="mb-0"><?= CURRENCY ?> <?= number_format($flow_data['balance'], 2) ?></h3>
+                                            <h3 id="balance" class="mb-0"><?= CURRENCY ?> <?= number_format($flow_data['balance'], 2) ?></h3>
                                         </div>
                                     </div>
                                 </div>
@@ -334,21 +345,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
                                         <div class="card-body">
                                             <h6 class="card-title">Valve Status</h6>
                                             <h3 class="mb-0">
+                                                <span id="valve_status" class="badge bg-<?= $flow_data['valve_status'] == 'open' ? 'success' : 'danger' ?>">
+                                                      <?= ucfirst($flow_data['valve_status']) ?>
+                                                </span>
+
                                                 <span class="badge bg-<?= $flow_data['valve_status'] == 'open' ? 'success' : 'danger' ?>">
                                                     <?= ucfirst($flow_data['valve_status']) ?>
                                                 </span>
                                             </h3>
                                             
-                                            <form method="POST" class="mt-3">
-                                                <div class="btn-group" role="group">
-                                                    <button type="submit" name="valve_action" value="open" class="btn btn-success">
-                                                        <i class="bi bi-valve-open"></i> Open Valve
-                                                    </button>
-                                                    <button type="submit" name="valve_action" value="close" class="btn btn-danger">
-                                                        <i class="bi bi-valve-closed"></i> Close Valve
-                                                    </button>
-                                                </div>
-                                            </form>
+<div class="btn-group" role="group">
+    <button type="button" class="btn btn-success" onclick="sendCommand('open')">
+        <i class="bi bi-valve-open"></i> Open Valve
+    </button>
+    <button type="button" class="btn btn-danger" onclick="sendCommand('close')">
+        <i class="bi bi-valve-closed"></i> Close Valve
+    </button>
+</div>
+
+<script>
+function sendCommand(action) {
+    const formData = new FormData();
+    formData.append('meter_id', <?= $meter_id ?>);
+    formData.append('valve_action', action);
+
+    fetch('send_command.php', {
+        method: 'POST',
+        body: formData
+    })
+    .then(res => res.json())
+    .then(data => {
+        if (data.status === 'success') {
+            alert('Command sent successfully (ID: ' + data.command_id + ')');
+        } else {
+            alert('Error: ' + data.message);
+        }
+    })
+    .catch(err => alert('Network error: ' + err));
+}
+</script>
+
                                         </div>
                                     </div>
                                 </div>
@@ -495,18 +531,20 @@ setInterval(() => {
     fetch('fetch_flow_data.php?meter_id=<?= $meter_id ?>')
         .then(res => res.json())
         .then(data => {
-            if (data.success) {
-                document.getElementById('flow_rate').innerText = data.flow_rate + ' L/min';
-                document.getElementById('session_volume').innerText = data.volume + ' L';
-                document.getElementById('total_volume').innerText = data.total_volume + ' L';
-                document.getElementById('balance').innerText = '<?= CURRENCY ?> ' + data.balance;
+            if (data.status === 'success') {
+                document.getElementById('flow_rate').innerText = data.flow_rate.toFixed(2) + ' L/min';
+                document.getElementById('session_volume').innerText = data.volume.toFixed(2) + ' L';
+                document.getElementById('total_volume').innerText = data.total_volume.toFixed(2) + ' L';
+                document.getElementById('balance').innerText = '<?= CURRENCY ?> ' + data.balance.toFixed(2);
 
                 const valveStatus = document.getElementById('valve_status');
-                valveStatus.innerText = data.valve_status;
+                valveStatus.innerText = data.valve_status.charAt(0).toUpperCase() + data.valve_status.slice(1);
                 valveStatus.className = 'badge bg-' + (data.valve_status === 'open' ? 'success' : 'danger');
             }
-        });
-}, 5000); // every 5 seconds
+        })
+        .catch(err => console.error('Flow data fetch failed:', err));
+}, 5000);
+ // every 5 seconds
 </script>
 
 </body>
