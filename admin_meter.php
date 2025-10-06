@@ -154,8 +154,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['topup_amount'])) {
 $stmt = $pdo->prepare("
     UPDATE flow_data
     SET balance = balance + ?
-    WHERE id = (
-        SELECT id FROM flow_data 
+    WHERE data_id = (
+        SELECT data_id FROM flow_data 
         WHERE meter_id = ? 
         ORDER BY recorded_at DESC 
         LIMIT 1
