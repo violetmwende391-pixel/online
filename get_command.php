@@ -138,48 +138,52 @@ if ($last_balance === false) {
     ");
     $stmt->execute([$meter_id]);
     $last_balance = (float)$stmt->fetchColumn();
-}
-
-$balance = (float)$last_balance;
-
-    // Prepare base response
-    $response = [
-        'status' => 'success',
-        'balance' => round($balance, 2),
-        'valve_command' => '',
-        'mode' => '',
-        'meter_status' => $meter['status']
-    ];
-
-    // Auto-mark valve commands older than 6 seconds as executed
-    $pdo->prepare("
-        UPDATE commands
-        SET executed = TRUE, executed_at = NOW()
-        WHERE command_type = 'valve'
-          AND executed = FALSE
-          AND issued_at <= NOW() - INTERVAL '12 SECOND'
-    ")->execute();
-
-    // Fetch the latest unexecuted valve command only
-    $pdo->beginTransaction();
-    $stmt = $pdo->prepare("
-        SELECT command_id, command_type, command_value
-        FROM commands
-        WHERE meter_id = ?
-          AND executed = FALSE
-          AND command_type = 'valve'
-        ORDER BY issued_at DESC
-        LIMIT 1
-    ");
-    $stmt->execute([$meter_id]);
-    $command = $stmt->fetch(PDO::FETCH_ASSOC);
-
-    if ($command) {
-        $response['valve_command'] = $command['command_value'];
-        $response['command_id'] = (int)$command['command_id'];
     }
 
-    $pdo->commit();
+    $balance = (float)$last_balance;
+    // Infer valve status based on balance changes
+// Infer valve status based on flow rate
+$stmt = $pdo->prepare("
+    SELECT flow_rate
+    FROM flow_data
+    WHERE meter_id = ?
+    ORDER BY recorded_at DESC
+    LIMIT 1
+");
+$stmt->execute([$meter_id]);
+$flow_rate = (float)$stmt->fetchColumn();
+
+$valve_status = ($flow_rate > 0.1) ? 'open' : 'closed';
+
+// Prepare base response
+$response = [
+    'status' => 'success',
+    'balance' => round($balance, 2),
+    'valve_status' => $valve_status,
+    'valve_command' => '',
+    'mode' => '',
+    'meter_status' => $meter['status']
+];
+
+// Fetch the latest command instantly (no waiting)
+$stmt = $pdo->prepare("
+    SELECT command_id, command_type, command_value
+    FROM commands
+    WHERE meter_id = ?
+      AND command_type = 'valve'
+      AND is_latest = TRUE
+    LIMIT 1
+");
+$stmt->execute([$meter_id]);
+$command = $stmt->fetch(PDO::FETCH_ASSOC);
+
+if ($command) {
+    $response['valve_command'] = $command['command_value'];
+    $response['command_id'] = (int)$command['command_id'];
+} else {
+    $response['valve_command'] = 'none';
+}
+
 
     // Send response
     echo json_encode($response);
@@ -208,12 +212,3 @@ $balance = (float)$last_balance;
     echo json_encode($response);
 }
 ?>
-
-
-
-
- 
-
-
-
- 

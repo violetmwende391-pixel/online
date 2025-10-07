@@ -18,16 +18,19 @@ try {
     $pdo->beginTransaction();
 
     $stmt = $pdo->prepare("
-        UPDATE commands 
-        SET executed = TRUE, executed_at = NOW(), notes = 'Overridden by new command'
-        WHERE meter_id = ? AND command_type = 'valve' AND executed = FALSE
+UPDATE commands 
+SET is_latest = FALSE, executed = TRUE, executed_at = NOW(), notes = 'Overridden by new command'
+WHERE meter_id = ? AND command_type = 'valve' AND is_latest = TRUE
+
     ");
     $stmt->execute([$meter_id]);
 
     $stmt = $pdo->prepare("
-        INSERT INTO commands (meter_id, command_type, command_value, issued_by, issued_at, executed)
-        VALUES (?, 'valve', ?, ?, NOW(), FALSE)
-        RETURNING command_id
+INSERT INTO commands (meter_id, command_type, command_value, issued_by, issued_at, executed, is_latest)
+VALUES (?, 'valve', ?, ?, NOW(), FALSE, TRUE)
+RETURNING command_id
+
+
     ");
     $stmt->execute([$meter_id, $action, $_SESSION['admin_id']]);
     $command_id = $stmt->fetchColumn();
