@@ -141,8 +141,9 @@ if ($last_balance === false) {
 }
 
 $balance = (float)$last_balance;
+ 
 
-    // Prepare base response
+     // Prepare base response
     $response = [
         'status' => 'success',
         'balance' => round($balance, 2),
@@ -151,35 +152,44 @@ $balance = (float)$last_balance;
         'meter_status' => $meter['status']
     ];
 
-    // Auto-mark valve commands older than 6 seconds as executed
-    $pdo->prepare("
-        UPDATE commands
-        SET executed = TRUE, executed_at = NOW()
-        WHERE command_type = 'valve'
-          AND executed = FALSE
-          AND issued_at <= NOW() - INTERVAL '12 SECOND'
-    ")->execute();
-
-    // Fetch the latest unexecuted valve command only
+    // Fetch and mark valve command as executed immediately (no delay)
     $pdo->beginTransaction();
-    $stmt = $pdo->prepare("
-        SELECT command_id, command_type, command_value
-        FROM commands
-        WHERE meter_id = ?
-          AND executed = FALSE
-          AND command_type = 'valve'
-        ORDER BY issued_at DESC
-        LIMIT 1
-    ");
-    $stmt->execute([$meter_id]);
-    $command = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if ($command) {
-        $response['valve_command'] = $command['command_value'];
-        $response['command_id'] = (int)$command['command_id'];
+    try {
+        // Get the latest unexecuted valve command with FOR UPDATE lock
+        $stmt = $pdo->prepare("
+            SELECT command_id, command_type, command_value
+            FROM commands
+            WHERE meter_id = ?
+              AND executed = FALSE
+              AND command_type = 'valve'
+            ORDER BY issued_at DESC
+            LIMIT 1
+            FOR UPDATE
+        ");
+        $stmt->execute([$meter_id]);
+        $command = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($command) {
+            // Immediately mark this command as executed
+            $updateStmt = $pdo->prepare("
+                UPDATE commands 
+                SET executed = TRUE, executed_at = NOW() 
+                WHERE command_id = ?
+            ");
+            $updateStmt->execute([$command['command_id']]);
+            
+            // Add to response
+            $response['valve_command'] = $command['command_value'];
+            $response['command_id'] = (int)$command['command_id'];
+        }
+
+        $pdo->commit();
+
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        throw $e;
     }
-
-    $pdo->commit();
 
     // Send response
     echo json_encode($response);
