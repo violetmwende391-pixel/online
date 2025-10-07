@@ -218,8 +218,9 @@ $balance = (float)$last_balance;
         'status' => 'error',
         'error' => 'Database error',
         'details' => (ENVIRONMENT === 'development') ? $e->getMessage() : null
+    ]
     ]);
-    ];
+    
     echo json_encode($response);
 
 } catch (Exception $e) {
