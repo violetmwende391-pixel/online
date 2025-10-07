@@ -22,7 +22,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-// Sanitize input
 // Sanitize input function (only declare if not already exists)
 if (!function_exists('sanitize')) {
     function sanitize($input) {
@@ -31,7 +30,6 @@ if (!function_exists('sanitize')) {
 }
 
 try {
-    // ----- POST: confirmation handler -----
     // ----- POST: confirmation handler (mark command executed) -----
     // Keep POST confirmation for non-valve commands
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -58,7 +56,6 @@ try {
         if ($stmt->rowCount() > 0) {
             echo json_encode(['status' => 'success', 'message' => 'Command marked executed']);
         } else {
-            echo json_encode(['status' => 'warning', 'message' => 'Command not updated (already executed or not found)']);
             echo json_encode(['status' => 'warning', 'message' => 'Command not updated (may already be executed or not exist)']);
         }
         exit;
@@ -87,8 +84,6 @@ try {
         exit;
     }
 
-    // Get meter info
-    $stmt = $pdo->prepare("SELECT meter_id, status FROM meters WHERE meter_serial = ? LIMIT 1");
     // Verify database connection
     if (!isset($pdo)) {
         throw new PDOException('Database connection not initialized');
@@ -122,7 +117,6 @@ try {
 
     $meter_id = $meter['meter_id'];
 
-    // ✅ Get the latest balance directly from flow_data
     // Calculate balance
 // Calculate balance: Prefer latest balance from flow_data, fallback to payments if no flow_data exists
 $stmt = $pdo->prepare("
@@ -138,25 +132,11 @@ $last_balance = $stmt->fetchColumn();
 if ($last_balance === false) {
     // No flow_data yet → fallback to total payments
     $stmt = $pdo->prepare("
-        SELECT balance
-        FROM flow_data
         SELECT COALESCE(SUM(amount), 0)
         FROM payments
         WHERE meter_id = ?
-        ORDER BY recorded_at DESC
-        LIMIT 1
     ");
     $stmt->execute([$meter_id]);
-    $last_balance = $stmt->fetchColumn();
-
-    if ($last_balance !== false) {
-        $balance = (float)$last_balance;
-    } else {
-        // If no flow_data yet, fall back to total payments
-        $stmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) FROM payments WHERE meter_id = ?");
-        $stmt->execute([$meter_id]);
-        $balance = (float)$stmt->fetchColumn();
-    }
     $last_balance = (float)$stmt->fetchColumn();
 }
 
@@ -171,18 +151,15 @@ $balance = (float)$last_balance;
         'meter_status' => $meter['status']
     ];
 
-    // Auto-mark stale valve commands
     // Auto-mark valve commands older than 6 seconds as executed
     $pdo->prepare("
         UPDATE commands
         SET executed = TRUE, executed_at = NOW()
         WHERE command_type = 'valve'
           AND executed = FALSE
-          AND issued_at <= NOW() - INTERVAL 12 SECOND
           AND issued_at <= NOW() - INTERVAL '12 SECOND'
     ")->execute();
 
-    // Fetch latest valve command
     // Fetch the latest unexecuted valve command only
     $pdo->beginTransaction();
     $stmt = $pdo->prepare("
@@ -213,26 +190,30 @@ $balance = (float)$last_balance;
     }
     http_response_code(500);
     error_log("get_command.php error: " . $e->getMessage());
-    echo json_encode([
     $response = [
         'status' => 'error',
         'error' => 'Database error',
         'details' => (ENVIRONMENT === 'development') ? $e->getMessage() : null
-    ]
-    ]);
-    
+    ];
     echo json_encode($response);
 
 } catch (Exception $e) {
     http_response_code(500);
     error_log("get_command.php error: " . $e->getMessage());
-    echo json_encode([
     $response = [
         'status' => 'error',
         'error' => 'Server error',
         'details' => (ENVIRONMENT === 'development') ? $e->getMessage() : null
-    ]);
     ];
     echo json_encode($response);
 }
 ?>
+
+
+
+
+ 
+
+
+
+ 
